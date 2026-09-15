@@ -143,6 +143,13 @@ pub struct Settings {
     /// or `tools` / `functions` / `json` to pin one shape and never send the
     /// others. The counterpart of Python's `llm_instructor_mode`.
     ///
+    /// `json_schema` is also accepted and is **not** a pin: it asks for
+    /// constrained decoding (`response_format: {"type": "json_schema", …,
+    /// "strict": true}`, the shape Python's `litellm_native` path sends) ahead
+    /// of the cascade and demotes back into it — strict, then non-strict, then
+    /// out — if the endpoint refuses the request shape, remembering the
+    /// demotion per schema. See `docs/configuration.md`.
+    ///
     /// Worth pinning on an endpoint whose shape is known — a vLLM deployment
     /// started without `--enable-auto-tool-choice --tool-call-parser` answers no
     /// tool call at all, and the adapter's miss probe has to rediscover that in
@@ -1908,8 +1915,11 @@ impl ConfigManager {
         self.bump_version();
     }
 
-    /// Set the structured-output request shape (`auto` | `tools` | `functions` |
-    /// `json`); see [`Settings::llm_structured_output_mode`].
+    /// Set the structured-output request shape (`auto` | `json_schema` |
+    /// `tools` | `functions` | `json`); see
+    /// [`Settings::llm_structured_output_mode`]. `tools` / `functions` / `json`
+    /// pin one shape; `json_schema` is a preference that demotes back to the
+    /// cascade rather than a pin.
     pub fn set_llm_structured_output_mode(&self, mode: &str) {
         let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
         s.llm_structured_output_mode = mode.to_string();

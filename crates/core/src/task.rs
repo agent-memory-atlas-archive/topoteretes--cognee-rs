@@ -1879,20 +1879,46 @@ mod tests {
         );
     }
 
-    /// Nesting is the documented way to fuse three or more branches, and it
-    /// must not serialise the inner pair against the outer one.
+    /// Nesting is the documented way to fuse three or more branches, and the
+    /// claim is that all three run concurrently — not merely that the values
+    /// come out right.
+    ///
+    /// All three branches are `Async` and park on the *same* three-party
+    /// barrier, so none can finish until all three are in flight. `Sync`
+    /// branches would not test this at all: they run while the futures are
+    /// being built, so a nesting that serialised its async branches would still
+    /// pass.
     #[tokio::test]
-    async fn try_parallel_nests_for_three_branches() {
-        let a: TypedTask<i32, i32> = TypedTask::sync(|x: &i32, _ctx| Ok(Box::new(*x + 1)));
-        let b: TypedTask<i32, i32> = TypedTask::sync(|x: &i32, _ctx| Ok(Box::new(*x + 2)));
-        let c: TypedTask<i32, i32> = TypedTask::sync(|x: &i32, _ctx| Ok(Box::new(*x + 3)));
+    async fn try_parallel_nests_three_concurrent_branches() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        /// One `Async` branch that adds `delta` once every branch has arrived.
+        fn branch(barrier: Arc<tokio::sync::Barrier>, delta: i32) -> TypedTask<i32, i32> {
+            TypedTask::async_fn(move |x: &i32, _ctx| {
+                let v = *x + delta;
+                let barrier = Arc::clone(&barrier);
+                Box::pin(async move {
+                    barrier.wait().await;
+                    Ok(Box::new(v))
+                })
+            })
+        }
+
+        let a = branch(Arc::clone(&barrier), 1);
+        let b = branch(Arc::clone(&barrier), 2);
+        let c = branch(barrier, 3);
 
         let bc: TypedTask<i32, (i32, i32)> =
-            TypedTask::try_parallel(b, c, |b, c| Ok(Box::new((*b, *c)))).expect("both Sync");
+            TypedTask::try_parallel(b, c, |b, c| Ok(Box::new((*b, *c)))).expect("both Async");
         let abc: TypedTask<i32, (i32, i32, i32)> =
             TypedTask::try_parallel(a, bc, |a, bc| Ok(Box::new((*a, bc.0, bc.1))))
                 .expect("both single-value");
 
-        assert_eq!(*call_fused(abc, 10_i32).await.unwrap(), (11, 12, 13));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), call_fused(abc, 10_i32))
+            .await
+            .expect("a nesting that serialised any branch would deadlock here")
+            .unwrap();
+
+        assert_eq!(*out, (11, 12, 13));
     }
 }

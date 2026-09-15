@@ -18,6 +18,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **`cognee-cognify`: summarization is re-typed over `ExtractedChunks`, and the
+  two graph/summarize pipeline stages are now one.** Graph extraction and
+  summarization run concurrently, as Python's single `extract_graph_and_summarize`
+  task always has (`asyncio.gather` over the same `data_chunks`). Summarization
+  never had a data dependency on graph extraction — it reads chunk text; it
+  consumed `ExtractedGraphData` only because that is what the stage in front of
+  it handed over.
+
+  Signatures that changed:
+
+  | Item | Before | After |
+  |---|---|---|
+  | `summarize_text` | `&ExtractedGraphData -> SummarizedData` | `&ExtractedChunks -> SummarizedChunks` |
+  | `make_summarize_text_task` | `TypedTask<ExtractedGraphData, SummarizedData>` | `TypedTask<ExtractedChunks, SummarizedChunks>` |
+  | `make_summarize_text_task_with_rank` | as above, plus `rank` | as above, plus `rank` |
+
+  `SummarizedChunks { summaries, failures }` is new; `SummarizedData` is
+  unchanged and is now produced by the fused stage.
+
+  **Migration.** A custom pipeline that chained `make_extract_graph_task` into
+  `make_summarize_text_task` replaces *both* with the new
+  `make_extract_graph_and_summarize_task` (or its `_with_rank` variant), which
+  takes exactly the arguments `make_extract_graph_task` took and keeps the
+  `ExtractedChunks -> SummarizedData` shape the pair had end to end. The two
+  halves remain separately available for a caller who wants to fuse one of them
+  against a different sibling, via the new `TypedTask::try_parallel` in
+  `cognee-core`. Provenance is unaffected: entities still stamp
+  `source_task = "extract_graph_from_data"` and summaries `"summarize_text"`,
+  both at `topological_rank` 3.
+
+  Two behavioural consequences, both shared with Python: the stage's peak
+  in-flight LLM calls is now the sum of the two `max_parallel_extractions`
+  semaphores rather than one of them (the transport-level
+  `cognee_llm::in_flight` ceiling still bounds the process), and under
+  `RollbackScope::FailedItems` an abort in extraction no longer prevents
+  summarization having already paid for the excluded files' chunks.
+
 - **`GenerationOptions::default()` no longer carries a `max_tokens`.** It set
   `Some(16384)`; it now leaves `None`. The field had to stop carrying a value so
   that `Some(n)` means "a caller chose n" — the OpenAI adapter refuses to raise a

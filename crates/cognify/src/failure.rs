@@ -267,7 +267,17 @@ pub struct FailureReport {
     total: usize,
     failed_items: BTreeSet<Uuid>,
     unreached_items: BTreeSet<Uuid>,
-    failed_chunks: usize,
+    /// The distinct chunks at least one of whose failures fails its item — the
+    /// numerator of [`Self::chunk_failure_ratio`].
+    ///
+    /// A **set**, not a counter, because one chunk can fail more than once: two
+    /// stages both work the same chunk, so a chunk whose graph extraction *and*
+    /// whose summarization failed produces two entries carrying the same
+    /// `chunk_id`. Counting failures there would charge one chunk twice and
+    /// hand `chunk_failure_ratio` a numerator that can exceed
+    /// [`Self::total_chunks`] — enough, on its own, to escalate a run that is
+    /// under the configured threshold into a fatal one.
+    failed_chunks: BTreeSet<Uuid>,
     summarization_failures: usize,
     total_chunks: usize,
     total_items: usize,
@@ -281,7 +291,7 @@ impl Default for FailureReport {
             total: 0,
             failed_items: BTreeSet::new(),
             unreached_items: BTreeSet::new(),
-            failed_chunks: 0,
+            failed_chunks: BTreeSet::new(),
             summarization_failures: 0,
             total_chunks: 0,
             total_items: 0,
@@ -317,8 +327,8 @@ impl FailureReport {
             // A file that failed is no longer "unreached" — a chunk of it was
             // attempted.
             self.unreached_items.remove(&failure.data_id);
-            if failure.chunk_id.is_some() {
-                self.failed_chunks += 1;
+            if let Some(chunk_id) = failure.chunk_id {
+                self.failed_chunks.insert(chunk_id);
             }
         }
         if self.entries.len() < self.cap {
@@ -350,21 +360,35 @@ impl FailureReport {
     /// # The sibling must be independent
     ///
     /// `other` must have been built fresh (`with_policy`) rather than cloned
-    /// from this report: every counter here is *added*, so a shared history
+    /// from this report: the two *counters* here are added, so a shared history
     /// would be counted twice. The concurrent stage gives each branch its own
     /// empty report for exactly this reason.
     ///
-    /// The id sets are unioned rather than added, and `failed_items` wins over
-    /// `unreached_items` on both sides afterwards — the same precedence
-    /// [`Self::mark_unreached`] applies, so a file one branch left undispatched
-    /// and the other actually failed ends up a failure.
+    /// # What is added and what is unioned
+    ///
+    /// Only [`Self::total`] and [`Self::summarization_failures`] are sums —
+    /// they count failures, and two failures are two failures even on one
+    /// chunk. Every id set is unioned, which is what keeps the merge honest
+    /// where the branches overlap: both work the *same* chunks, so a chunk that
+    /// failed extraction and also failed summarization appears on both sides,
+    /// and adding [`Self::failed_chunks`] would charge it twice and hand
+    /// [`Self::chunk_failure_ratio`] a numerator that can exceed
+    /// [`Self::total_chunks`].
+    ///
+    /// `failed_items` wins over `unreached_items` on both sides afterwards —
+    /// the same precedence [`Self::mark_unreached`] applies, so a file one
+    /// branch left undispatched and the other actually failed ends up a
+    /// failure.
     ///
     /// [`Self::note_totals`] values are taken from `other` only where this
     /// report has none, since they are per-run denominators, not sums.
     pub fn absorb(&mut self, other: &FailureReport) {
         self.total += other.total;
         self.summarization_failures += other.summarization_failures;
-        self.failed_chunks += other.failed_chunks;
+        // Unioned, not added: the two branches work the same chunks, so the
+        // same `chunk_id` can appear on both sides.
+        self.failed_chunks
+            .extend(other.failed_chunks.iter().copied());
         self.failed_items.extend(other.failed_items.iter().copied());
         self.unreached_items
             .extend(other.unreached_items.iter().copied());
@@ -447,7 +471,7 @@ impl FailureReport {
         if self.total_chunks == 0 {
             return 0.0;
         }
-        self.failed_chunks as f64 / self.total_chunks as f64
+        self.failed_chunks.len() as f64 / self.total_chunks as f64
     }
 
     /// Whether this report makes the run fail, under `policy`.
@@ -945,6 +969,76 @@ mod tests {
     }
 
     // ── absorb: folding a concurrent sibling's report back in ────────────────
+
+    /// The ratio's numerator counts *chunks*, not failures carrying a chunk id.
+    ///
+    /// Two stages work the same chunk, so one chunk can fail twice. Counting
+    /// the failures gave a numerator that can exceed `total_chunks` — a ratio
+    /// above 1.0, which under `FailedItems` escalates a run that is under its
+    /// configured threshold into a fatal one that sweeps everything.
+    ///
+    /// Reachable within a single report, and so predates the concurrent stage:
+    /// under `RunToEnd` extraction drops nothing, so summarization has always
+    /// been able to fail a chunk extraction had already failed.
+    #[test]
+    fn one_chunk_failing_in_two_stages_counts_once_toward_the_ratio() {
+        let data_id = Uuid::new_v4();
+        let chunk_id = Uuid::new_v4();
+
+        let mut report = FailureReport::default();
+        report.note_totals(1, 1);
+        report.record(item_failure(
+            FailureStage::GraphExtraction,
+            data_id,
+            Some(chunk_id),
+        ));
+        report.record(item_failure(
+            FailureStage::Summarization,
+            data_id,
+            Some(chunk_id),
+        ));
+
+        assert_eq!(report.total(), 2, "two failures really did happen");
+        assert!(
+            (report.chunk_failure_ratio() - 1.0).abs() < f64::EPSILON,
+            "but only one chunk failed, so the ratio is 1/1, got {}",
+            report.chunk_failure_ratio()
+        );
+    }
+
+    /// The same chunk, failed once on each side of a concurrent stage. This is
+    /// the path the fused extract-and-summarize stage opened: summarization no
+    /// longer runs on extraction's filtered chunk list, so under the default
+    /// `FailFast` both branches can fail the same chunk.
+    #[test]
+    fn absorb_counts_a_chunk_both_branches_failed_only_once() {
+        let data_id = Uuid::new_v4();
+        let chunk_id = Uuid::new_v4();
+
+        let mut extraction = FailureReport::default();
+        extraction.note_totals(1, 2);
+        extraction.record(item_failure(
+            FailureStage::GraphExtraction,
+            data_id,
+            Some(chunk_id),
+        ));
+
+        let mut summarization = FailureReport::default();
+        summarization.record(item_failure(
+            FailureStage::Summarization,
+            data_id,
+            Some(chunk_id),
+        ));
+
+        extraction.absorb(&summarization);
+
+        assert_eq!(extraction.total(), 2);
+        assert!(
+            (extraction.chunk_failure_ratio() - 0.5).abs() < f64::EPSILON,
+            "one distinct chunk of two, got {}",
+            extraction.chunk_failure_ratio()
+        );
+    }
 
     #[test]
     fn absorb_sums_counters_and_unions_the_id_sets() {

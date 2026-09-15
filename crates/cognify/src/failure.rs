@@ -277,6 +277,18 @@ pub struct FailureReport {
     /// hand `chunk_failure_ratio` a numerator that can exceed
     /// [`Self::total_chunks`] — enough, on its own, to escalate a run that is
     /// under the configured threshold into a fatal one.
+    ///
+    /// This changed the serialized shape of the field, from a number to an
+    /// array of uuids, and **no compatibility shim accepts the old form**. A
+    /// legacy `"failed_chunks": 1` carries no chunk ids, so it cannot populate
+    /// the set; a deserializer that took it would produce a report whose ratio
+    /// reads correctly but whose set cannot be unioned by [`Self::absorb`] —
+    /// silently reintroducing the very miscount above, in the one direction
+    /// (undercount) that hides a fatal run rather than inventing one. A hard
+    /// failure on a stale payload is the better error. Nothing in this
+    /// workspace serialises a report — [`crate::rollback`] writes the
+    /// `run_info` row as a hand-built object carrying the *derived* ratio —
+    /// so this reaches only an external caller who persisted one itself.
     failed_chunks: BTreeSet<Uuid>,
     summarization_failures: usize,
     total_chunks: usize,

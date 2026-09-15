@@ -5689,6 +5689,25 @@ fn merge_graph_and_summaries(
 /// [`RollbackScope::FailedItems`] an abort in
 /// extraction no longer stops summarization from having already paid for the
 /// excluded files' chunks — see [`merge_graph_and_summaries`].
+///
+/// # Retries
+///
+/// One stage is one retry unit, so a `RetryPolicy` that re-runs this task
+/// re-dispatches **both** branches, including the one that had already
+/// succeeded. That is inert on every shipped path —
+/// [`build_cognify_pipeline`] sets no policy and
+/// [`RetryPolicy::NoRetry`](cognee_core::RetryPolicy) is the
+/// `PipelineBuilder` default, so cognify does not retry tasks at all — and it
+/// is what Python does, whose `extract_graph_and_summarize` is likewise a
+/// single task. It matters only to an embedder who composes a custom pipeline
+/// with `RetryPolicy::Limited`, who should know that the granularity here is
+/// the pair: retrying is already expensive at this stage (extraction alone
+/// re-issues every extraction call, and it has written graph nodes, edges and
+/// ownership rows by the time it can fail), and fusing widens that to
+/// summarization's calls too. A caller who needs independent retry boundaries
+/// wants the two halves as separate stages, which is what the
+/// [`make_extract_graph_task`] / [`make_summarize_text_task`] pair still
+/// offers.
 pub fn make_extract_graph_and_summarize_task(
     llm: Arc<dyn Llm>,
     graph_db: Arc<dyn GraphDBTrait>,

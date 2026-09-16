@@ -531,6 +531,31 @@ The token counter is env-selected:
 |---|---|---|
 | `COGNEE_TOKEN_COUNTER` | `tiktoken` / `word` / `huggingface`(`hf`) | auto from embedding provider |
 | `HUGGINGFACE_TOKENIZER` | model id when counter = `huggingface` | _(empty)_ |
+| `COGNEE_LEGACY_PER_WORD_TOKEN_COUNT` | restore the legacy per-word token count (`1`/`true`/`yes`/`on`) | `false` |
+
+### `COGNEE_LEGACY_PER_WORD_TOKEN_COUNT` — a deliberate divergence from Python
+
+By default a chunk's size is the tokenizer's count of the chunk itself. Until
+SDK-632 it was the sum of the counts of its *words, each tokenized in
+isolation*, and sub-word tokenizers are not additive over a partition: cl100k
+encodes `" the"` as one token but `"the"` and `" "` as two. MEASURED, the sum
+over-states the span by **1.78x** on Alice in Wonderland, so a chunk configured
+at 8191 tokens held **4,669** and the run made ~1.8x the LLM calls it was
+configured for. The default now fills that budget to **8,188 of 8,191**.
+
+**Python 1.5.x still counts per word** — VERIFIED at
+`cognee/tasks/chunks/chunk_by_sentence.py`, whose `get_word_size(word)` calls
+`embedding_engine.tokenizer.count_tokens(word)` once per word. So the Rust
+default is knowingly *not* byte-for-byte with Python's chunk boundaries. Setting
+`COGNEE_LEGACY_PER_WORD_TOKEN_COUNT=1` restores that parity at the cost of the
+over-count; it exists for that comparison and for a deployment that has tuned
+around the old effective chunk size, and is expected to go once Python ships the
+same fix. Only `1`/`true`/`yes`/`on` enable it — an unrecognised value leaves
+the default in place rather than silently halving the chunk size.
+
+Full measurement record, methodology, the two further consequences this was
+checked against, and how to reproduce it:
+[docs/performance/chunk-token-overcount.md](performance/chunk-token-overcount.md).
 
 ## Cognify failure handling
 

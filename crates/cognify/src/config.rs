@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use cognee_chunking::TokenCounterKind;
+use cognee_chunking::{TokenCountMode, TokenCounterKind};
 use cognee_embedding::engine::EmbeddingEngine;
 use cognee_llm::{Llm, Transcriber};
 use serde::{Deserialize, Serialize};
@@ -234,6 +234,19 @@ pub struct CognifyConfig {
     /// Default is determined at construction time via [`TokenCounterKind::from_env`].
     pub token_counter_kind: TokenCounterKind,
 
+    /// Whether a chunk's size is the tokenizer's verdict on the whole span
+    /// (the default) or the legacy sum over words counted in isolation.
+    ///
+    /// Default is determined at construction time via
+    /// [`TokenCountMode::from_env`], i.e. [`TokenCountMode::Span`] unless
+    /// `COGNEE_LEGACY_PER_WORD_TOKEN_COUNT` opts back in. Per-word counting
+    /// over-states a span by ~1.7x on English prose, so it fills chunks to
+    /// roughly 60% of the configured budget; it is retained because it is what
+    /// Python 1.5.x still does, and is therefore the setting that reproduces
+    /// Python's chunk boundaries byte for byte.
+    #[serde(default)]
+    pub token_count_mode: TokenCountMode,
+
     /// Axis 1 of failure handling — when a run stops scheduling further work.
     ///
     /// Default [`FailureStop::FailFast`], which with the default
@@ -412,6 +425,7 @@ impl Default for CognifyConfig {
             data_per_batch: 20,
 
             token_counter_kind: TokenCounterKind::from_env(),
+            token_count_mode: TokenCountMode::from_env(),
 
             // Read from the environment like `token_counter_kind` above, so
             // every construction path picks them up. `failure_stop` honours
@@ -562,6 +576,12 @@ impl CognifyConfig {
     /// Set the token counter implementation to use during chunking.
     pub fn with_token_counter(mut self, kind: TokenCounterKind) -> Self {
         self.token_counter_kind = kind;
+        self
+    }
+
+    /// Set how chunk sizes are measured during chunking.
+    pub fn with_token_count_mode(mut self, mode: TokenCountMode) -> Self {
+        self.token_count_mode = mode;
         self
     }
 

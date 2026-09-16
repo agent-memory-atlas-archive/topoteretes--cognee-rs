@@ -11,7 +11,7 @@ use uuid::Uuid;
 use cognee_models::DocumentChunk;
 
 use crate::chunk_by_paragraph::chunk_by_paragraph;
-use crate::token_counter::TokenCounter;
+use crate::token_counter::{TokenCountMode, TokenCounter};
 
 /// NAMESPACE_OID from the uuid spec.
 ///
@@ -27,6 +27,12 @@ pub const NAMESPACE_OID: Uuid = Uuid::NAMESPACE_OID;
 /// 3. On overflow, emit the accumulated text (joined with space) as a DocumentChunk.
 /// 4. If a single paragraph exceeds `max_chunk_size` on its own (oversized), emit it as-is.
 /// 5. Emit any remaining accumulated text at the end.
+///
+/// `mode` selects how sizes are measured — see [`TokenCountMode`]. Under the
+/// default [`TokenCountMode::Span`] the `chunk_size` a chunk reports is counted
+/// from the text it actually carries, including the `" "` this function
+/// inserts between batched paragraphs; the accumulation decision keeps using
+/// the summed paragraph sizes, which err on the small side of the limit.
 #[allow(
     clippy::expect_used,
     reason = "accumulated is guaranteed non-empty by the !accumulated.is_empty() guards preceding each expect call"
@@ -36,8 +42,14 @@ pub fn chunk_text<C: TokenCounter>(
     text: &str,
     max_chunk_size: usize,
     counter: &C,
+    mode: TokenCountMode,
 ) -> Vec<DocumentChunk> {
-    let paragraph_chunks = chunk_by_paragraph(text, max_chunk_size, true, counter);
+    let paragraph_chunks = chunk_by_paragraph(text, max_chunk_size, true, counter, mode);
+    // Size of an emitted chunk, in whichever unit `mode` reports.
+    let emitted_size = |text: &str, accumulated: usize| match mode {
+        TokenCountMode::PerWord => accumulated,
+        TokenCountMode::Span => counter.count_tokens(text),
+    };
     let mut result = Vec::new();
     let mut accumulated: Vec<&crate::chunk_by_paragraph::ParagraphChunk<'_>> = Vec::new();
     let mut accumulated_size: usize = 0;
@@ -51,7 +63,7 @@ pub fn chunk_text<C: TokenCounter>(
             result.push(DocumentChunk::new(
                 para.chunk_id,
                 para.text.to_owned(),
-                para.chunk_size,
+                emitted_size(para.text, para.chunk_size),
                 chunk_index,
                 para.cut_type.to_string(),
                 document_id,
@@ -64,13 +76,14 @@ pub fn chunk_text<C: TokenCounter>(
                 .collect::<Vec<_>>()
                 .join(" ");
             let cut_type = accumulated.last().expect("accumulated is non-empty because the else branch is only entered when !accumulated.is_empty()").cut_type.to_string();
+            let size = emitted_size(&chunk_text, accumulated_size);
             result.push(DocumentChunk::new(
                 Uuid::new_v5(
                     &NAMESPACE_OID,
                     format!("{document_id}-{chunk_index}").as_bytes(),
                 ),
                 chunk_text,
-                accumulated_size,
+                size,
                 chunk_index,
                 cut_type,
                 document_id,
@@ -89,13 +102,14 @@ pub fn chunk_text<C: TokenCounter>(
             .collect::<Vec<_>>()
             .join(" ");
         let cut_type = accumulated.last().expect("accumulated is non-empty because the if-guard !accumulated.is_empty() was checked above").cut_type.to_string();
+        let size = emitted_size(&chunk_text, accumulated_size);
         result.push(DocumentChunk::new(
             Uuid::new_v5(
                 &NAMESPACE_OID,
                 format!("{document_id}-{chunk_index}").as_bytes(),
             ),
             chunk_text,
-            accumulated_size,
+            size,
             chunk_index,
             cut_type,
             document_id,
@@ -118,14 +132,20 @@ mod tests {
     #[test]
     fn empty_input() {
         let doc_id = Uuid::new_v4();
-        let chunks = chunk_text(doc_id, "", 100, &WordCounter);
+        let chunks = chunk_text(doc_id, "", 100, &WordCounter, TokenCountMode::Span);
         assert!(chunks.is_empty());
     }
 
     #[test]
     fn single_short_paragraph() {
         let doc_id = Uuid::new_v4();
-        let chunks = chunk_text(doc_id, "Hello world.", 100, &WordCounter);
+        let chunks = chunk_text(
+            doc_id,
+            "Hello world.",
+            100,
+            &WordCounter,
+            TokenCountMode::Span,
+        );
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hello world.");
         assert_eq!(chunks[0].chunk_size, 2);
@@ -137,7 +157,7 @@ mod tests {
     fn multiple_small_paragraphs_batch() {
         let doc_id = Uuid::new_v4();
         let text = "First. Second. Third.";
-        let chunks = chunk_text(doc_id, text, 100, &WordCounter);
+        let chunks = chunk_text(doc_id, text, 100, &WordCounter, TokenCountMode::Span);
         // All fit into one chunk
         assert_eq!(chunks.len(), 1);
     }
@@ -147,7 +167,7 @@ mod tests {
         let doc_id = Uuid::new_v4();
         // Each sentence is 2 words, max 3 words per chunk
         let text = "One two. Three four. Five six.";
-        let chunks = chunk_text(doc_id, text, 3, &WordCounter);
+        let chunks = chunk_text(doc_id, text, 3, &WordCounter, TokenCountMode::Span);
         assert!(chunks.len() >= 2);
         // Check sequential indices
         for (i, chunk) in chunks.iter().enumerate() {
@@ -159,15 +179,15 @@ mod tests {
     fn deterministic_uuids() {
         let doc_id = Uuid::new_v4();
         let text = "Hello world. This is a test.";
-        let chunks1 = chunk_text(doc_id, text, 100, &WordCounter);
-        let chunks2 = chunk_text(doc_id, text, 100, &WordCounter);
+        let chunks1 = chunk_text(doc_id, text, 100, &WordCounter, TokenCountMode::Span);
+        let chunks2 = chunk_text(doc_id, text, 100, &WordCounter, TokenCountMode::Span);
         assert_eq!(chunks1[0].base.id, chunks2[0].base.id);
     }
 
     #[test]
     fn document_id_propagated() {
         let doc_id = Uuid::new_v4();
-        let chunks = chunk_text(doc_id, "Hello.", 100, &WordCounter);
+        let chunks = chunk_text(doc_id, "Hello.", 100, &WordCounter, TokenCountMode::Span);
         assert_eq!(chunks[0].document_id, doc_id);
     }
 
@@ -175,7 +195,7 @@ mod tests {
     fn chunk_index_sequential() {
         let doc_id = Uuid::new_v4();
         let text = "A. B. C. D. E. F. G. H.";
-        let chunks = chunk_text(doc_id, text, 2, &WordCounter);
+        let chunks = chunk_text(doc_id, text, 2, &WordCounter, TokenCountMode::Span);
         for (i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.chunk_index, i);
         }
@@ -185,7 +205,7 @@ mod tests {
     fn whitespace_only_input_emits_single_chunk() {
         let doc_id = Uuid::new_v4();
         let input = "   \n\t   \r\n   ";
-        let chunks = chunk_text(doc_id, input, 512, &WordCounter);
+        let chunks = chunk_text(doc_id, input, 512, &WordCounter, TokenCountMode::Span);
         assert_eq!(chunks.len(), 1, "whitespace-only should emit 1 chunk");
         assert_eq!(chunks[0].text, input);
         assert_eq!(chunks[0].chunk_index, 0);
@@ -200,7 +220,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let input = format!("{long_para}.\nShort text here.");
-        let chunks = chunk_text(doc_id, &input, 50, &WordCounter);
+        let chunks = chunk_text(doc_id, &input, 50, &WordCounter, TokenCountMode::Span);
         // The 100-word sentence is pre-split by chunk_by_sentence into 2 chunks
         // of 50 words, plus the short paragraph makes 3 total
         assert!(
@@ -234,7 +254,7 @@ mod tests {
             .join(" ");
         let small = "Short text here.";
         let input = format!("{large}.\n{small}\n{large}.\n{small}");
-        let chunks = chunk_text(doc_id, &input, 10, &WordCounter);
+        let chunks = chunk_text(doc_id, &input, 10, &WordCounter, TokenCountMode::Span);
         // Each 20-word "large" paragraph is pre-split into 2 chunks of 10 by
         // chunk_by_sentence, resulting in 6 total chunks:
         //   large_part1(10), large_part2(10), small(3),

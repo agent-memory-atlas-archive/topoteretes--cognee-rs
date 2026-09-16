@@ -26,7 +26,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use cognee_chunking::{CutType, NAMESPACE_OID, TokenCounterKind, chunk_by_row, chunk_text};
+use cognee_chunking::{
+    CutType, NAMESPACE_OID, TokenCountMode, TokenCounterKind, chunk_by_row, chunk_text,
+};
 use cognee_core::{
     CpuPool, Pipeline, PipelineBuilder, PipelineContext, TaskContextBuilder, TypedTask, Value,
 };
@@ -350,6 +352,7 @@ async fn chunk_one_document(
     storage: &dyn StorageTrait,
     max_chunk_size: usize,
     counter: &(dyn cognee_chunking::TokenCounter + Send + Sync),
+    token_count_mode: TokenCountMode,
     db: Option<&DatabaseConnection>,
     loader_registry: &LoaderRegistry,
 ) -> Result<Vec<DocumentChunk>, CognifyError> {
@@ -408,7 +411,13 @@ async fn chunk_one_document(
         .map_err(|e| CognifyError::ChunkingError(e.to_string()))?;
 
     let mut chunks = match output {
-        LoaderOutput::Text(text) => chunk_text(document.base.id, &text, max_chunk_size, &counter),
+        LoaderOutput::Text(text) => chunk_text(
+            document.base.id,
+            &text,
+            max_chunk_size,
+            &counter,
+            token_count_mode,
+        ),
         LoaderOutput::Rows(rows) => {
             let joined = rows.join("\n\n");
             chunk_by_row(document.base.id, &joined, max_chunk_size, &counter)
@@ -498,6 +507,7 @@ pub async fn extract_chunks_from_documents(
     storage: &dyn StorageTrait,
     max_chunk_size: usize,
     token_counter_kind: TokenCounterKind,
+    token_count_mode: TokenCountMode,
     db: Option<&DatabaseConnection>,
     loader_registry: &LoaderRegistry,
     failure_policy: FailurePolicy,
@@ -522,6 +532,7 @@ pub async fn extract_chunks_from_documents(
             storage,
             max_chunk_size,
             counter.as_ref(),
+            token_count_mode,
             db,
             loader_registry,
         )
@@ -5373,6 +5384,7 @@ pub fn make_extract_chunks_task(
     storage: Arc<dyn StorageTrait>,
     max_chunk_size: usize,
     token_counter_kind: TokenCounterKind,
+    token_count_mode: TokenCountMode,
     db: Option<Arc<DatabaseConnection>>,
     loader_registry: Arc<LoaderRegistry>,
     failure_policy: FailurePolicy,
@@ -5381,6 +5393,7 @@ pub fn make_extract_chunks_task(
         storage,
         max_chunk_size,
         token_counter_kind,
+        token_count_mode,
         db,
         loader_registry,
         failure_policy,
@@ -5394,6 +5407,7 @@ pub fn make_extract_chunks_task_with_rank(
     storage: Arc<dyn StorageTrait>,
     max_chunk_size: usize,
     token_counter_kind: TokenCounterKind,
+    token_count_mode: TokenCountMode,
     db: Option<Arc<DatabaseConnection>>,
     loader_registry: Arc<LoaderRegistry>,
     failure_policy: FailurePolicy,
@@ -5412,6 +5426,7 @@ pub fn make_extract_chunks_task_with_rank(
                 &*storage,
                 max_chunk_size,
                 token_counter_kind,
+                token_count_mode,
                 db.as_deref(),
                 &loader_registry,
                 failure_policy,
@@ -5988,6 +6003,7 @@ pub fn build_cognify_pipeline(
             storage,
             config.chunk_size(),
             config.token_counter_kind.clone(),
+            config.token_count_mode,
             // Still `Option`: the chunk stage uses the connection for
             // incremental-loading bookkeeping, not for writing artifacts,
             // so it is not part of this invariant.
@@ -6105,6 +6121,7 @@ pub fn build_temporal_cognify_pipeline(
             storage,
             config.chunk_size(),
             config.token_counter_kind.clone(),
+            config.token_count_mode,
             Some(Arc::clone(&db)),
             loader_registry,
             config.failure_policy(),
@@ -6459,6 +6476,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),
@@ -7123,6 +7141,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),
@@ -7170,6 +7189,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),
@@ -7259,6 +7279,7 @@ mod tests {
             storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             config.failure_policy(),
@@ -8937,6 +8958,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),
@@ -9011,6 +9033,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),
@@ -9129,6 +9152,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),
@@ -9199,6 +9223,7 @@ mod tests {
             &*storage,
             100,
             TokenCounterKind::Word,
+            TokenCountMode::Span,
             None,
             &registry,
             CognifyConfig::default().failure_policy(),

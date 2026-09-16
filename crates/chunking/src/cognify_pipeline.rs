@@ -11,7 +11,7 @@ use tracing::{debug, info, info_span, instrument};
 
 use crate::error::ChunkingError;
 use crate::text_chunker::chunk_text;
-use crate::token_counter::{TokenCounter, WordCounter};
+use crate::token_counter::{TokenCountMode, TokenCounter, WordCounter};
 
 /// The extract text chunks pipeline.
 ///
@@ -39,17 +39,23 @@ impl ExtractTextChunksPipeline {
         data_items: Vec<Data>,
         max_chunk_size: usize,
     ) -> Result<Vec<DocumentChunk>, ChunkingError> {
-        self.extract_chunks_with_counter(data_items, max_chunk_size, &WordCounter)
-            .await
+        self.extract_chunks_with_counter(
+            data_items,
+            max_chunk_size,
+            &WordCounter,
+            TokenCountMode::default(),
+        )
+        .await
     }
 
-    /// Extract text chunks with a custom token counter.
+    /// Extract text chunks with a custom token counter and sizing mode.
     #[instrument(name = "chunking.extract_chunks", skip(self, data_items, counter), fields(max_chunk_size, data_count = data_items.len()))]
     pub async fn extract_chunks_with_counter<C: TokenCounter>(
         &self,
         data_items: Vec<Data>,
         max_chunk_size: usize,
         counter: &C,
+        mode: TokenCountMode,
     ) -> Result<Vec<DocumentChunk>, ChunkingError> {
         if max_chunk_size == 0 {
             return Err(ChunkingError::InvalidChunkSize(0));
@@ -76,7 +82,7 @@ impl ExtractTextChunksPipeline {
             let content = String::from_utf8(content_bytes)
                 .map_err(|e| ChunkingError::InvalidUtf8(e.to_string()))?;
 
-            let chunks = chunk_text(document.base.id, &content, max_chunk_size, counter);
+            let chunks = chunk_text(document.base.id, &content, max_chunk_size, counter, mode);
             debug!(chunk_count = chunks.len(), document_id = %document.base.id, "document chunked");
             all_chunks.extend(chunks);
         }

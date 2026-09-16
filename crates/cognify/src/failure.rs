@@ -348,6 +348,28 @@ impl FailureReport {
         }
     }
 
+    /// Drop from the ratio numerator every chunk outside `keep`.
+    ///
+    /// For a report collected by a branch that ran **concurrently** with the
+    /// branch that decides which chunks survive. Summarization works the full
+    /// chunk list, so it can fail a chunk of a file graph extraction has just
+    /// abandoned; counting that chunk would push
+    /// [`Self::chunk_failure_ratio`] up on behalf of work the run has already
+    /// given up on, and under [`RollbackScope::FailedItems`] the ratio is what
+    /// decides whether the run is fatal. Sequentially this could not happen —
+    /// summarization only ever saw the surviving chunks — so applying this
+    /// before [`Self::absorb`] is what keeps the fused stage's fatality
+    /// decision identical to the sequential one.
+    ///
+    /// Only the numerator is scoped. The entry stays in the list and the file
+    /// stays in [`Self::failed_items`]: the failure really did happen and is
+    /// worth reporting, and the file is outstanding either way — `is_fatal`'s
+    /// survival backstop subtracts `failed_items` and `unreached_items`
+    /// *together*, so moving an id between them changes nothing there.
+    pub fn retain_failed_chunks(&mut self, keep: &BTreeSet<Uuid>) {
+        self.failed_chunks.retain(|id| keep.contains(id));
+    }
+
     /// Note that `data_id`'s work was never attempted, because an earlier
     /// failure stopped the run first. Unreached files are not failures — they
     /// are simply redone by the next run — but they must not be marked
@@ -476,9 +498,15 @@ impl FailureReport {
 
     /// Item-failing chunk failures over the run's chunk count.
     ///
-    /// Summarization failures are excluded by construction: a tolerated one
-    /// never enters [`Self::failed_chunks`], and the ratio only gates the
-    /// `FailedItems` scope. `0.0` when the run produced no chunks.
+    /// Distinct chunks, not failures — see [`Self::failed_chunks`]. A
+    /// *tolerated* summarization failure is excluded, because
+    /// `tolerate_summarization_failures` clears `fails_item` and only an
+    /// item-failing entry reaches the set; an untolerated one is **not**,
+    /// and `tolerate_summarization_failures` is off by default, so
+    /// summarization ordinarily does move this ratio. (An earlier version of
+    /// this comment said summarization was "excluded by construction", which
+    /// was true of neither default.) The ratio only gates the `FailedItems`
+    /// scope. `0.0` when the run produced no chunks.
     pub fn chunk_failure_ratio(&self) -> f64 {
         if self.total_chunks == 0 {
             return 0.0;

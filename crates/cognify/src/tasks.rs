@@ -22,7 +22,7 @@
 //! - Pipeline builders: [`build_cognify_pipeline`], [`build_temporal_cognify_pipeline`]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -5632,7 +5632,7 @@ fn merge_graph_and_summaries(
     graph: ExtractedGraphData,
     summarized: SummarizedChunks,
 ) -> SummarizedData {
-    let surviving_chunks: HashSet<Uuid> = graph.chunks.iter().map(|c| c.base.id).collect();
+    let surviving_chunks: BTreeSet<Uuid> = graph.chunks.iter().map(|c| c.base.id).collect();
     let mut summaries = summarized.summaries;
     let before = summaries.len();
     // `made_from` is set at construction for every summary this stage produces;
@@ -5645,8 +5645,18 @@ fn merge_graph_and_summaries(
         );
     }
 
+    // Same exclusion, applied to the ratio numerator. Summarization worked the
+    // full chunk list, so it can have failed a chunk of a file extraction has
+    // just abandoned, and charging that to `chunk_failure_ratio` would push a
+    // `FailedItems` run toward fatal on behalf of work already given up on.
+    // Extraction's *own* failed chunks are deliberately not scoped this way —
+    // they are excluded from `graph.chunks` precisely because they failed, and
+    // they are what the ratio is meant to measure.
+    let mut summarization_failures = summarized.failures;
+    summarization_failures.retain_failed_chunks(&surviving_chunks);
+
     let mut failures = graph.failures;
-    failures.absorb(&summarized.failures);
+    failures.absorb(&summarization_failures);
 
     SummarizedData {
         chunks: graph.chunks,
@@ -5752,6 +5762,18 @@ pub fn make_extract_graph_and_summarize_task_with_rank(
         rank,
     );
     let summarize = make_summarize_text_task_with_rank(llm, config, rank);
+    // ⚠️ `try_parallel` returns on the first branch error and drops the other,
+    // and the branch that can be dropped here is the one that writes — graph
+    // nodes, edges and ownership rows. That is safe only because the
+    // summarization branch has no reachable error path: `summarize_text`
+    // collects every per-chunk failure into its report and returns `Ok`, so
+    // the extraction branch is never the one cancelled. **Adding a fallible
+    // step to summarization breaks that**, and would tear extraction down
+    // mid-write with its `FailureReport` lost along with the dropped future —
+    // partial graph state that nothing records and nothing sweeps. Anything
+    // that can genuinely fail in summarization belongs in its report, not in
+    // its `Result`; if that ever stops being possible, this call has to await
+    // both branches and reconcile afterwards instead.
     #[allow(
         clippy::expect_used,
         reason = "invariant is upheld by construction — see the message"
@@ -8678,6 +8700,125 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(kept_chunk.base.id)],
             "only the surviving chunk's summary is kept"
+        );
+    }
+
+    /// A summarization failure on a chunk extraction abandoned must not push
+    /// the run toward fatal.
+    ///
+    /// Sequentially this was unreachable: summarization only ever saw
+    /// extraction's surviving chunks. Concurrently it works the full list, so
+    /// it can fail a chunk of a file the abort already excluded — and
+    /// `chunk_failure_ratio` is what decides fatality under `FailedItems`.
+    /// Charging it would make the fused stage fail runs the sequential one
+    /// tolerated.
+    #[test]
+    fn merge_keeps_abandoned_chunks_out_of_the_failure_ratio() {
+        // Three files, one chunk each. Extraction fails the first, which under
+        // `FailFast` leaves the third undispatched; the abort excludes both,
+        // and only `kept_doc` survives. Summarization, running the full list,
+        // fails the *undispatched* file's chunk — a chunk extraction never
+        // charged, so this is the case a set union alone cannot fix.
+        let kept_doc = Uuid::new_v4();
+        let failed_doc = Uuid::new_v4();
+        let unreached_doc = Uuid::new_v4();
+        let kept_chunk = test_chunk(Uuid::new_v4(), kept_doc, "kept");
+        let failed_chunk = test_chunk(Uuid::new_v4(), failed_doc, "failed");
+        let unreached_chunk = test_chunk(Uuid::new_v4(), unreached_doc, "unreached");
+
+        let mut extraction_failures = FailureReport::default();
+        extraction_failures.note_totals(3, 3);
+        extraction_failures.record(StageFailure {
+            stage: FailureStage::GraphExtraction,
+            data_id: failed_doc,
+            chunk_id: Some(failed_chunk.base.id),
+            error: "extraction failed".to_string(),
+            fails_item: true,
+        });
+        extraction_failures.mark_unreached(unreached_doc);
+        let graph = ExtractedGraphData {
+            chunks: vec![kept_chunk.clone()],
+            documents: vec![test_document_with_metadata(kept_doc, None)],
+            entities: vec![],
+            edges: vec![],
+            producers: ArtifactProducers::default(),
+            dataset_id: Uuid::new_v4(),
+            user_id: None,
+            tenant_id: None,
+            failures: extraction_failures,
+        };
+
+        let mut own = FailureReport::default();
+        own.record(StageFailure {
+            stage: FailureStage::Summarization,
+            data_id: unreached_doc,
+            chunk_id: Some(unreached_chunk.base.id),
+            error: "summary failed".to_string(),
+            fails_item: true,
+        });
+        let merged = merge_graph_and_summaries(
+            graph,
+            SummarizedChunks {
+                summaries: vec![],
+                failures: own,
+            },
+        );
+
+        // One distinct chunk of three — extraction's own, which is what the
+        // ratio is meant to measure. Exactly the sequential pipeline's value;
+        // unscoped it would be 2/3, which crosses a threshold 1/3 does not.
+        assert!(
+            (merged.failures.chunk_failure_ratio() - 1.0 / 3.0).abs() < f64::EPSILON,
+            "expected 1 failed chunk of 3, got a ratio of {}",
+            merged.failures.chunk_failure_ratio()
+        );
+        // The failure itself is still reported — only the numerator is scoped.
+        assert_eq!(merged.failures.total(), 2);
+        assert!(merged.failures.failed_items().contains(&unreached_doc));
+    }
+
+    /// The scoping above must not swallow a summarization failure on a chunk
+    /// that *did* survive — that one is the ratio's business as much as
+    /// extraction's.
+    #[test]
+    fn merge_counts_summarization_failures_on_surviving_chunks() {
+        let doc = Uuid::new_v4();
+        let chunk = test_chunk(Uuid::new_v4(), doc, "kept");
+
+        let mut extraction_failures = FailureReport::default();
+        extraction_failures.note_totals(1, 2);
+        let graph = ExtractedGraphData {
+            chunks: vec![chunk.clone()],
+            documents: vec![test_document_with_metadata(doc, None)],
+            entities: vec![],
+            edges: vec![],
+            producers: ArtifactProducers::default(),
+            dataset_id: Uuid::new_v4(),
+            user_id: None,
+            tenant_id: None,
+            failures: extraction_failures,
+        };
+
+        let mut own = FailureReport::default();
+        own.record(StageFailure {
+            stage: FailureStage::Summarization,
+            data_id: doc,
+            chunk_id: Some(chunk.base.id),
+            error: "summary failed".to_string(),
+            fails_item: true,
+        });
+        let merged = merge_graph_and_summaries(
+            graph,
+            SummarizedChunks {
+                summaries: vec![],
+                failures: own,
+            },
+        );
+
+        assert!(
+            (merged.failures.chunk_failure_ratio() - 0.5).abs() < f64::EPSILON,
+            "a surviving chunk's summarization failure still counts, got {}",
+            merged.failures.chunk_failure_ratio()
         );
     }
 

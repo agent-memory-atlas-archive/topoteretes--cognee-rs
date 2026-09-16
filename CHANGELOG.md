@@ -53,7 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semaphores rather than one of them (the transport-level
   `cognee_llm::in_flight` ceiling still bounds the process); under
   `RollbackScope::FailedItems` an abort in extraction no longer prevents
-  summarization having already paid for the excluded files' chunks; and one
+  summarization having already paid for the excluded files' chunks — wasted
+  spend only, since those chunks are kept out of `chunk_failure_ratio()`, so a
+  run's fatality decision is the same as the sequential pipeline's; and one
   stage is one retry unit, so a custom `RetryPolicy::Limited` re-dispatches
   *both* branches rather than each independently. The last is inert on shipped
   paths — `build_cognify_pipeline` sets no policy and `RetryPolicy::NoRetry` is

@@ -395,6 +395,32 @@ pub async fn create_new_dataset(
     })?;
     let db = components.database.clone();
 
+    // The dataset id is deterministic — `uuid5(name, owner, tenant)` — so it
+    // names the identity being created before any row exists, which is exactly
+    // what a lock covering "decide it is missing, then create it" has to key
+    // on. Computed up front for that reason, and reused as the row's id below.
+    let new_id = cognee_ingestion::generate_dataset_id(&payload.name, user.id, user.tenant_id);
+
+    // Serialize this whole handler — lookup, insert, grant and the
+    // compensating rollback — against every other writer of the same identity
+    // in this process (SDK-636). The row and its ACL rows cannot share a
+    // transaction, so there is a window between the insert and the grant in
+    // which the row exists but is not yet usable, and a rollback may still
+    // remove it. The lock is what keeps that window private:
+    //
+    //   1. A second `POST /v1/datasets` for the same name blocks here rather
+    //      than observing the row and answering 200 for a dataset this request
+    //      then rolls back.
+    //   2. A concurrent `POST /v1/add` with the same `datasetName` takes the
+    //      same lock inside `persist_data_with_acl`, so it cannot ingest into a
+    //      row that is about to be deleted out from under it — it either finds
+    //      a committed dataset or creates its own.
+    //
+    // In-process only: two replicas on one database still race. Closing that
+    // needs an advisory lock in the store or an ACL that shares the metadata
+    // transaction, neither of which is available here.
+    let _identity_guard = state.dataset_locks.lock(new_id).await;
+
     // Check if a dataset with this name already exists for the user.
     let existing = IngestDb::get_dataset_by_name(&*db, &payload.name, user.id, user.tenant_id)
         .await
@@ -404,37 +430,20 @@ pub async fn create_new_dataset(
     // deliberate: re-granting here would turn an idempotent create into an ACL
     // reset, letting an owner restore a deliberately revoked `read` grant just
     // by POSTing the same name again. The rollback below is what keeps that
-    // safe — it guarantees a row that exists is a row whose grants were
-    // written, so there is never a half-finished dataset needing repair.
-    //
-    // ⚠️ Not serialized against anything else touching the same name while the
-    // grant below is in flight. Two known windows, both open only between the
-    // insert and the grant, and both closed by the same missing piece — a lock
-    // keyed on the deterministic dataset id, or a store that can hold the row
-    // and its ACL rows in one transaction. Neither this handler nor `AppState`
-    // has one today:
-    //
-    //   1. A second `POST /v1/datasets` for the same name observes the row and
-    //      answers 200 for a dataset the first request then rolls back.
-    //   2. Worse: a concurrent `POST /v1/add` with the same `datasetName`
-    //      resolves this row and ingests into it, and the rollback then deletes
-    //      it out from under that data. `DeleteDb::delete_dataset` is the raw
-    //      row delete, not `components.delete_service`, so `dataset_data` links
-    //      are orphaned rather than swept.
-    //
-    // Accepted for now because the failure it replaced — a dataset silently
-    // created with no ACL rows — was *permanent* and needed no concurrency to
-    // hit, whereas these need a failing ACL write and a simultaneous second
-    // request, and leave a retryable state. Tracked in SDK-636; do not close it
-    // by re-granting on the already-exists arm below (that was tried and
-    // reverted — it lets a revoked grant be restored by re-POSTing the name).
+    // safe — whenever the compensation *succeeds*, a row that exists is a row
+    // whose grants were written. It is not an absolute: when the revokes or the
+    // attached-data check fail, the branch below deliberately keeps a
+    // half-finished row and says so, because deleting it would be worse. That
+    // row needs the manual repair the error names; it is not something the
+    // already-exists arm can fix. Do not close any concurrency gap by
+    // re-granting here either (that was tried and reverted — it lets a revoked
+    // grant be restored by re-POSTing the name).
     if let Some(ds) = existing {
         return Ok(Json(dataset_to_dto(&ds)));
     }
 
     // Create a new dataset.
-    let new_id = cognee_ingestion::generate_dataset_id(&payload.name, user.id, user.tenant_id);
-    let dataset = Dataset::new(payload.name, user.id, user.tenant_id, new_id);
+    let dataset = Dataset::new(payload.name.clone(), user.id, user.tenant_id, new_id);
     let created = db
         .create_dataset(dataset)
         .await
@@ -489,10 +498,49 @@ pub async fn create_new_dataset(
         // next create of the same name, which would then silently inherit a
         // partial permission set. Keeping the row instead leaves the damage
         // visible to `GET /v1/datasets` and to the operator this error names.
-        if cleanup_errors.is_empty()
-            && let Err(e) = DeleteDb::delete_dataset(&*db, created.id).await
-        {
-            cleanup_errors.push(format!("delete dataset row: {e}"));
+        //
+        // Deliberately **not** routed through `components.delete_service`, which
+        // SDK-636 proposed for its `dataset_data` sweeping. Two reasons, both
+        // verified in `crates/delete`:
+        //
+        //   * `DeleteScope::Dataset` resolves by *name*, and
+        //     `resolve_dataset_scope` passes `tenant_id: None` to
+        //     `get_dataset_by_name`, which then applies no tenant predicate and
+        //     takes `.one()` unordered. In a tenanted deployment where this
+        //     owner has a same-named dataset under another tenant, the rollback
+        //     could hard-delete *that* dataset instead of the row we just
+        //     wrote. Targeting `created.id` cannot misresolve.
+        //   * `DeleteMode::Hard` runs `sweep_orphan_nodes` /
+        //     `sweep_orphan_edge_types`, which are graph-*wide*
+        //     (`get_degree_one_nodes("Entity")`, no dataset scoping). One
+        //     failed grant on an empty new dataset would purge degree-one
+        //     entities belonging to every other dataset and user.
+        //
+        // The sweeping the ticket wanted is unnecessary here anyway: under the
+        // identity lock this row is ours alone and still empty, so a row delete
+        // orphans nothing. Verify instead of assuming — the lock is
+        // in-process, so a second replica over the same database can still have
+        // attached to it. If anything did, keep the row: deleting would either
+        // orphan the links or destroy data whose caller was told the ingest
+        // succeeded.
+        if cleanup_errors.is_empty() {
+            // `count_dataset_data` is a `SELECT COUNT(*)`; `get_dataset_data`
+            // would materialise every linked row just to ask "any?", and this
+            // runs precisely when another writer may have attached a lot.
+            match DeleteDb::count_dataset_data(&*db, created.id).await {
+                Ok(0) => {
+                    if let Err(e) = DeleteDb::delete_dataset(&*db, created.id).await {
+                        cleanup_errors.push(format!("delete dataset row: {e}"));
+                    }
+                }
+                Ok(attached) => {
+                    cleanup_errors.push(format!(
+                        "{attached} data row(s) are attached (another writer ingested \
+                         into it); the row is kept rather than deleted"
+                    ));
+                }
+                Err(e) => cleanup_errors.push(format!("check attached data: {e}")),
+            }
         }
 
         if !cleanup_errors.is_empty() {
@@ -572,6 +620,14 @@ pub async fn delete_all_datasets(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("DB error: {e}")))?;
 
     for ds in datasets {
+        // Take the identity lock for each dataset in turn (SDK-636). A create
+        // for this id may be parked between its insert and its grant, and that
+        // row is already visible to `list_datasets_by_owner` — so without the
+        // lock this loop deletes it mid-window and the create then answers 200
+        // for a dataset that no longer exists. One lock at a time, released
+        // before the next is taken, so this cannot deadlock against a handler
+        // holding a different identity.
+        let _identity_guard = state.dataset_locks.lock(ds.id).await;
         let request = DeleteRequest {
             scope: DeleteScope::Dataset {
                 owner_id: user.id,
@@ -611,6 +667,11 @@ pub async fn delete_dataset(
 
     let db = components.database.clone();
     let delete_service = components.delete_service.clone();
+
+    // Same identity lock as the create path (SDK-636): a create for this id may
+    // be parked between its insert and its grant, and deleting that row
+    // mid-window makes the create answer 200 for a dataset that is gone.
+    let _identity_guard = state.dataset_locks.lock(dataset_id).await;
 
     check_permission_via_handles(components, user.id, dataset_id, "delete")
         .await

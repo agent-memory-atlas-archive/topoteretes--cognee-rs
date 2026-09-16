@@ -28,6 +28,7 @@ use cognee_storage::StorageTrait;
 use cognee_vector::VectorDB;
 
 use crate::content_hasher::HashAlgorithm;
+use crate::dataset_locks::DatasetLocks;
 use crate::id_generation::{generate_data_id, generate_dataset_id};
 use crate::loader_registry::get_loader_name;
 use crate::loaders::{LoaderOutput, LoaderRegistry};
@@ -350,12 +351,13 @@ pub async fn persist_data(
     owner_id: Uuid,
     tenant_id: Option<Uuid>,
 ) -> Result<Data, Box<dyn std::error::Error>> {
-    persist_data_with_acl(
+    persist_data_with_acl_and_locks(
         processed,
         database,
         dataset_name,
         owner_id,
         tenant_id,
+        None,
         None,
         None,
     )
@@ -365,17 +367,13 @@ pub async fn persist_data(
 /// Like [`persist_data`], but optionally grants all four ACL permissions
 /// (read, write, delete, share) to the owner when a new dataset is created.
 ///
-/// When `acl_db` is `Some`, the owner is ensured as a principal and receives
-/// all permissions on newly created datasets, matching Python's
-/// `create_authorized_dataset()` behavior.
-///
-/// When `target_dataset_id` is `Some`, the pipeline looks up the dataset by UUID
-/// instead of name, allowing callers to target a specific existing dataset.
-#[instrument(
-    name = "ingestion.persist_data_with_acl",
-    skip(processed, database, acl_db),
-    fields(data_id = %processed.data_id)
-)]
+/// Unsynchronised: equivalent to
+/// [`persist_data_with_acl_and_locks`] with no locks. Kept at its original
+/// seven-argument shape because it is public API re-exported from both
+/// `cognee_ingestion` and `cognee`, and no existing caller should have to
+/// change to say "I am the only writer" — which is what `None` means and what
+/// every single-caller embedder (the CLI, the library facade) wants. Serving
+/// concurrent requests? Use [`persist_data_with_acl_and_locks`].
 pub async fn persist_data_with_acl(
     processed: &ProcessedInput,
     database: &dyn IngestDb,
@@ -385,6 +383,83 @@ pub async fn persist_data_with_acl(
     acl_db: Option<&dyn AclDb>,
     target_dataset_id: Option<Uuid>,
 ) -> Result<Data, Box<dyn std::error::Error>> {
+    persist_data_with_acl_and_locks(
+        processed,
+        database,
+        dataset_name,
+        owner_id,
+        tenant_id,
+        acl_db,
+        target_dataset_id,
+        None,
+    )
+    .await
+}
+
+/// Like [`persist_data_with_acl`], but serializes the dataset
+/// create-and-grant against concurrent writers of the same dataset identity.
+///
+/// When `acl_db` is `Some`, the owner is ensured as a principal and receives
+/// all permissions on newly created datasets, matching Python's
+/// `create_authorized_dataset()` behavior.
+///
+/// When `target_dataset_id` is `Some`, the pipeline looks up the dataset by UUID
+/// instead of name, allowing callers to target a specific existing dataset.
+///
+/// When `dataset_locks` is `Some`, the by-name "look it up, create it if
+/// missing, grant the owner" sequence runs under the lock for that dataset
+/// identity, serializing it against every other writer of the same identity in
+/// this process — most importantly `POST /v1/datasets`, whose compensating
+/// rollback would otherwise be able to delete the dataset out from under data
+/// this call just attached to it. See [`crate::dataset_locks`]. `None` keeps
+/// the previous unsynchronised behaviour, which is what every single-threaded
+/// caller (the CLI, the library facade) wants.
+#[instrument(
+    name = "ingestion.persist_data_with_acl",
+    skip(processed, database, acl_db, dataset_locks),
+    fields(data_id = %processed.data_id)
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is one independent dimension of \"persist this item\" \
+              — the store, the identity, and three orthogonal opt-ins; bundling \
+              them into a struct would only move the same list one level out"
+)]
+pub async fn persist_data_with_acl_and_locks(
+    processed: &ProcessedInput,
+    database: &dyn IngestDb,
+    dataset_name: &str,
+    owner_id: Uuid,
+    tenant_id: Option<Uuid>,
+    acl_db: Option<&dyn AclDb>,
+    target_dataset_id: Option<Uuid>,
+    dataset_locks: Option<&DatasetLocks>,
+) -> Result<Data, Box<dyn std::error::Error>> {
+    // Take the identity lock before looking anything up, on *both* resolution
+    // paths.
+    //
+    // The by-id path needs it just as much as the by-name one, which is not
+    // obvious: it creates nothing and grants nothing, so there is no
+    // insert-to-grant window of its own. But the window this guards is not
+    // about what *this* call creates — it is about attaching data to a row
+    // somebody else is about to roll back. A caller can reach a half-created
+    // row by id: `uuid5(name, owner, tenant)` is derivable by anyone who knows
+    // the name, and `GET /v1/datasets` lists rows from ownership without
+    // requiring a live grant, so the id is observable mid-window. Resolving by
+    // id without the lock would walk straight into the case the by-name lock
+    // exists to prevent.
+    //
+    // Acquired here rather than inside the branches so the guard outlives both
+    // the resolve and the grant below — releasing between them would reopen
+    // exactly the window this closes.
+    let dataset_guard = match dataset_locks {
+        Some(locks) => Some(match target_dataset_id {
+            Some(ds_id) => locks.lock(ds_id).await,
+            None => locks.lock_for_name(dataset_name, owner_id, tenant_id).await,
+        }),
+        None => None,
+    };
+
     // Resolve the dataset: prefer explicit UUID, fall back to name-based lookup.
     let is_new_dataset;
     let dataset = if let Some(ds_id) = target_dataset_id {
@@ -429,6 +504,15 @@ pub async fn persist_data_with_acl(
             "ACL permissions granted on new dataset"
         );
     }
+
+    // The dataset now exists with its grants committed, so the window is shut
+    // and nothing below can be invalidated by a concurrent create: a create
+    // that arrives from here on finds the row and short-circuits, and its
+    // rollback only ever deletes a row it wrote itself. Release rather than
+    // holding to the end of the function — the remaining work is this item's
+    // own data write, and keeping the lock would serialize every concurrent
+    // `add` into one dataset behind a single file at a time.
+    drop(dataset_guard);
 
     let data_id = processed.data_id;
 
@@ -870,6 +954,11 @@ struct AddParamsInjection {
     node_set_json: Option<String>,
     importance_weight: Option<f64>,
     target_dataset_id: Option<Uuid>,
+    /// Identity locks serializing dataset create-and-grant against concurrent
+    /// writers, or `None` for the unsynchronised single-caller default. Wired
+    /// by embedders that serve concurrent requests — see
+    /// [`AddPipeline::with_dataset_locks`].
+    dataset_locks: Option<Arc<DatasetLocks>>,
 }
 
 /// Build a persist task whose closure also patches the [`ProcessedInput`]
@@ -893,11 +982,12 @@ fn make_persist_data_task_with_acl_and_params(
             processed.importance_weight = Some(w);
         }
         let override_ds = add_params.target_dataset_id;
+        let dataset_locks = add_params.dataset_locks.clone();
         let database = Arc::clone(&database);
         let dataset_name = dataset_name.clone();
         let acl_db = acl_db.clone();
         Box::pin(async move {
-            persist_data_with_acl(
+            persist_data_with_acl_and_locks(
                 &processed,
                 &*database,
                 &dataset_name,
@@ -905,6 +995,7 @@ fn make_persist_data_task_with_acl_and_params(
                 tenant_id,
                 acl_db.as_deref(),
                 override_ds,
+                dataset_locks.as_deref(),
             )
             .await
             .map(Box::new)
@@ -1036,6 +1127,8 @@ pub struct AddPipeline {
     db_connection: Option<Arc<DatabaseConnection>>,
     // ─── Pipeline-run trail (gap 08-07) ───────────────────────────────────
     pipeline_run_repo: Option<Arc<dyn PipelineRunRepository>>,
+    // ─── Concurrency (SDK-636) ────────────────────────────────────────────
+    dataset_locks: Option<Arc<DatasetLocks>>,
 }
 
 impl AddPipeline {
@@ -1059,6 +1152,7 @@ impl AddPipeline {
             vector_db: None,
             db_connection: None,
             pipeline_run_repo: None,
+            dataset_locks: None,
         }
     }
 
@@ -1078,6 +1172,7 @@ impl AddPipeline {
             vector_db: None,
             db_connection: None,
             pipeline_run_repo: None,
+            dataset_locks: None,
         }
     }
 
@@ -1088,6 +1183,24 @@ impl AddPipeline {
     /// `create_authorized_dataset()` behavior.
     pub fn with_acl_db(mut self, acl_db: Arc<dyn AclDb>) -> Self {
         self.acl_db = Some(acl_db);
+        self
+    }
+
+    /// Serialize dataset create-and-grant against other writers of the same
+    /// dataset identity in this process.
+    ///
+    /// Only embedders that serve concurrent requests need this — an HTTP
+    /// server whose `POST /v1/datasets` handler shares the same
+    /// [`DatasetLocks`] registry. Without it an `add` can resolve a dataset
+    /// row that a concurrent create is about to roll back, and the data it
+    /// writes is left pointing at a dataset that no longer exists. See
+    /// [`crate::dataset_locks`].
+    ///
+    /// Left unset the pipeline behaves exactly as before, which is what the
+    /// CLI and the library facade want: one caller, nothing to serialize
+    /// against.
+    pub fn with_dataset_locks(mut self, locks: Arc<DatasetLocks>) -> Self {
+        self.dataset_locks = Some(locks);
         self
     }
 
@@ -1196,6 +1309,7 @@ impl AddPipeline {
             node_set_json,
             importance_weight: params.importance_weight,
             target_dataset_id: params.dataset_id,
+            dataset_locks: self.dataset_locks.clone(),
         };
 
         // ── Build the typed pipeline ─────────────────────────────────────

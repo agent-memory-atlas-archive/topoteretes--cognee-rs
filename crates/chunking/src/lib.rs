@@ -9,7 +9,10 @@
 //!   where the link would be unresolved on a `--target wasm32` doc build)
 //! - [`token_counter`] — the [`token_counter::TokenCounter`] trait and its
 //!   `WordCounter` / `HuggingFaceTokenCounter` / `TikTokenCounter` impls,
-//!   selected by [`config`] (`TokenCounterKind::from_env`)
+//!   selected by [`config`] (`TokenCounterKind::from_env`), plus
+//!   [`token_counter::TokenCountMode`], which decides whether a chunk's size is
+//!   the tokenizer's verdict on the whole span (the default) or the legacy sum
+//!   over words in isolation
 
 pub mod chunk_by_paragraph;
 pub mod chunk_by_row;
@@ -39,4 +42,4 @@ pub use text_chunker::{NAMESPACE_OID, chunk_text};
 pub use token_counter::HuggingFaceTokenCounter;
 #[cfg(feature = "tiktoken")]
 pub use token_counter::TikTokenCounter;
-pub use token_counter::{TokenCounter, WordCounter};
+pub use token_counter::{TokenCountMode, TokenCounter, WordCounter};

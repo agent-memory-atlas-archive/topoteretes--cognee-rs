@@ -49,7 +49,7 @@ pub mod cognify {
     #[cfg(feature = "tiktoken")]
     pub use cognee_chunking::TikTokenCounter;
     pub use cognee_chunking::{
-        ChunkingError, CutType, TokenCounter, TokenCounterKind, WordCounter,
+        ChunkingError, CutType, TokenCountMode, TokenCounter, TokenCounterKind, WordCounter,
     };
     pub use cognee_cognify::*;
 }

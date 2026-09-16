@@ -35,6 +35,16 @@ tiktoken-rs = { workspace = true, optional = true }
 cognee-storage = { path = "../storage", version = "0.2.0" }
 tokio.workspace = true
 
+# Declared so these targets are *skipped* without the feature rather than
+# compiled down to a green `running 0 tests` — the failure mode SDK-666 tracks.
+[[test]]
+name = "token_count_modes"
+required-features = ["tiktoken"]
+
+[[example]]
+name = "measure_token_overcount"
+required-features = ["tiktoken"]
+
 [features]
 default      = []
 hf-tokenizer = ["dep:tokenizers", "tokenizers/http"]

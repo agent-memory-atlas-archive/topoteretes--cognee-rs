@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::chunk_by_word::{WordType, chunk_by_word};
 use crate::cut_type::CutType;
-use crate::token_counter::TokenCounter;
+use crate::token_counter::{TokenCountMode, TokenCounter};
 
 /// A sentence-level chunk with metadata. Borrows text from the input.
 #[derive(Debug, Clone)]
@@ -43,6 +43,26 @@ fn offset_in(base: &str, slice: &str) -> usize {
 /// - `maximum_size`: optional max token count per sentence. If a sentence would
 ///   exceed this, it is yielded early and the overflowing word starts a new one.
 /// - `counter`: token counter implementation
+/// - `mode`: how a sentence's size is measured — see [`TokenCountMode`]. Under
+///   the default [`TokenCountMode::Span`] the reported `size` is the counter's
+///   verdict on the emitted slice itself, so it is exact by construction.
+///
+/// # Cost
+///
+/// The overflow check needs a *prospective* size — "would this sentence still
+/// fit if I took the next word?" — which a span count cannot give
+/// incrementally, and re-counting the accumulated span once per word would be
+/// quadratic. So the per-word counts are still taken, as a cheap upper bound
+/// that decides when to *look*; only an exact re-count of the accumulated span
+/// may decide to *cut*, and a false alarm re-baselines the bound to that exact
+/// value. Each re-baseline raises the exact floor, which makes the number of
+/// re-counts per oversized sentence logarithmic in `maximum_size` rather than
+/// linear in words.
+///
+/// [`TokenCountMode::Span`] therefore tokenizes each emitted sentence *in
+/// addition to* each word, roughly doubling the tokenizer work of the per-word
+/// path it replaces. That is a few milliseconds per document, against the LLM
+/// call per extra chunk that the over-count was buying.
 #[allow(
     clippy::expect_used,
     reason = "sentence_start invariants are upheld by the is_some() guard and the explicit set above each emit branch"
@@ -51,15 +71,25 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
     data: &'a str,
     maximum_size: Option<usize>,
     counter: &C,
+    mode: TokenCountMode,
 ) -> Vec<SentenceChunk<'a>> {
     let words = chunk_by_word(data);
     let mut result = Vec::new();
     let mut paragraph_id = Uuid::new_v4();
+    // Under `PerWord` this is the reported size. Under `Span` it is only an
+    // upper bound used to decide when to spend an exact re-count; the reported
+    // size is always counted from the emitted slice.
     let mut sentence_size: usize = 0;
     let mut word_type_state = WordType::Word;
     // Track the byte range of the current sentence in `data`.
     let mut sentence_start: Option<usize> = None;
     let mut sentence_end: usize = 0;
+
+    // Size of the slice about to be emitted, in whichever unit `mode` reports.
+    let emitted_size = |start: usize, end: usize, accumulated: usize| match mode {
+        TokenCountMode::PerWord => accumulated,
+        TokenCountMode::Span => counter.count_tokens(&data[start..end]),
+    };
 
     for word_chunk in &words {
         let word = word_chunk.text;
@@ -82,15 +112,33 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
             }
         }
 
-        // Check overflow
-        if let Some(max) = maximum_size
-            && sentence_size + word_size > max
-            && sentence_start.is_some()
+        // What the accumulator would read once this word is taken in.
+        let mut next_size = sentence_size + word_size;
+
+        // Check overflow. Summed per-word counts over-estimate the span they
+        // compose, so under `Span` a hit here is only a suspicion: confirm it
+        // against the real span before cutting, and re-baseline the accumulator
+        // on a false alarm so the bound does not trip again on every
+        // subsequent word.
+        let mut overflows = maximum_size.is_some_and(|max| next_size > max);
+        if overflows
+            && mode == TokenCountMode::Span
+            && let Some(start) = sentence_start
+            && let Some(max) = maximum_size
         {
+            let exact_with_word = counter.count_tokens(&data[start..word_end_byte]);
+            if exact_with_word <= max {
+                overflows = false;
+                next_size = exact_with_word;
+            }
+        }
+
+        if overflows && sentence_start.is_some() {
+            let start = sentence_start.expect("sentence_start is Some because the guard sentence_start.is_some() was checked before this branch");
             result.push(SentenceChunk {
                 paragraph_id,
-                text: &data[sentence_start.expect("sentence_start is Some because the guard sentence_start.is_some() was checked before this branch")..sentence_end],
-                size: sentence_size,
+                text: &data[start..sentence_end],
+                size: emitted_size(start, sentence_end, sentence_size),
                 cut_type: word_type_to_cut_type(word_type_state),
             });
             sentence_start = Some(word_start_byte);
@@ -104,18 +152,18 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
                 sentence_start = Some(word_start_byte);
             }
             sentence_end = word_end_byte;
-            sentence_size += word_size;
+            sentence_size = next_size;
 
             if word_type == WordType::ParagraphEnd {
                 paragraph_id = Uuid::new_v4();
             }
 
+            let start = sentence_start
+                .expect("sentence_start is Some because it was just set above if it was None");
             result.push(SentenceChunk {
                 paragraph_id,
-                text: &data[sentence_start
-                    .expect("sentence_start is Some because it was just set above if it was None")
-                    ..sentence_end],
-                size: sentence_size,
+                text: &data[start..sentence_end],
+                size: emitted_size(start, sentence_end, sentence_size),
                 cut_type: word_type_to_cut_type(word_type_state),
             });
             sentence_start = None;
@@ -125,7 +173,7 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
                 sentence_start = Some(word_start_byte);
             }
             sentence_end = word_end_byte;
-            sentence_size += word_size;
+            sentence_size = next_size;
         }
     }
 
@@ -138,7 +186,7 @@ pub fn chunk_by_sentence<'a, C: TokenCounter>(
         result.push(SentenceChunk {
             paragraph_id,
             text: &data[start..sentence_end],
-            size: sentence_size,
+            size: emitted_size(start, sentence_end, sentence_size),
             cut_type,
         });
     }
@@ -153,13 +201,13 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        let chunks = chunk_by_sentence("", None, &WordCounter);
+        let chunks = chunk_by_sentence("", None, &WordCounter, TokenCountMode::Span);
         assert!(chunks.is_empty());
     }
 
     #[test]
     fn single_sentence() {
-        let chunks = chunk_by_sentence("Hello world.", None, &WordCounter);
+        let chunks = chunk_by_sentence("Hello world.", None, &WordCounter, TokenCountMode::Span);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hello world.");
         assert_eq!(chunks[0].size, 2);
@@ -168,7 +216,12 @@ mod tests {
 
     #[test]
     fn two_sentences_same_paragraph() {
-        let chunks = chunk_by_sentence("Hello world. Foo bar.", None, &WordCounter);
+        let chunks = chunk_by_sentence(
+            "Hello world. Foo bar.",
+            None,
+            &WordCounter,
+            TokenCountMode::Span,
+        );
         assert_eq!(chunks.len(), 2);
         // Same paragraph_id for both
         assert_eq!(chunks[0].paragraph_id, chunks[1].paragraph_id);
@@ -184,6 +237,7 @@ mod tests {
             "First paragraph.\nSecond paragraph.\nThird.",
             None,
             &WordCounter,
+            TokenCountMode::Span,
         );
         assert_eq!(chunks.len(), 3);
         // First paragraph_end triggers new id for chunks[0]
@@ -194,7 +248,7 @@ mod tests {
 
     #[test]
     fn sentence_cut_no_punctuation() {
-        let chunks = chunk_by_sentence("Hello world", None, &WordCounter);
+        let chunks = chunk_by_sentence("Hello world", None, &WordCounter, TokenCountMode::Span);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].cut_type, CutType::SentenceCut);
     }
@@ -202,7 +256,12 @@ mod tests {
     #[test]
     fn maximum_size_overflow() {
         // max 2 words per sentence
-        let chunks = chunk_by_sentence("one two three four", Some(2), &WordCounter);
+        let chunks = chunk_by_sentence(
+            "one two three four",
+            Some(2),
+            &WordCounter,
+            TokenCountMode::Span,
+        );
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].text, "one two ");
         assert_eq!(chunks[0].size, 2);
@@ -212,7 +271,12 @@ mod tests {
 
     #[test]
     fn token_counting_matches_word_count() {
-        let chunks = chunk_by_sentence("This is a test sentence.", None, &WordCounter);
+        let chunks = chunk_by_sentence(
+            "This is a test sentence.",
+            None,
+            &WordCounter,
+            TokenCountMode::Span,
+        );
         assert_eq!(chunks[0].size, 5);
     }
 
@@ -231,7 +295,7 @@ mod tests {
 
         for &(name, text) in &texts {
             for max in max_sizes {
-                let chunks = chunk_by_sentence(text, max, &counter);
+                let chunks = chunk_by_sentence(text, max, &counter, TokenCountMode::Span);
                 let reconstructed: String = chunks.iter().map(|c| c.text).collect();
                 assert_eq!(
                     reconstructed, text,
@@ -255,7 +319,7 @@ mod tests {
 
         for &(name, text) in &texts {
             for max in [16_usize, 64] {
-                let chunks = chunk_by_sentence(text, Some(max), &counter);
+                let chunks = chunk_by_sentence(text, Some(max), &counter, TokenCountMode::Span);
                 for (i, chunk) in chunks.iter().enumerate() {
                     assert!(
                         chunk.size <= max,
@@ -272,7 +336,7 @@ mod tests {
         use crate::test_inputs::CHINESE_TEXT;
 
         let counter = WordCounter;
-        let chunks = chunk_by_sentence(CHINESE_TEXT, Some(16), &counter);
+        let chunks = chunk_by_sentence(CHINESE_TEXT, Some(16), &counter, TokenCountMode::Span);
         assert!(
             !chunks.is_empty(),
             "Chinese text should produce at least one chunk"

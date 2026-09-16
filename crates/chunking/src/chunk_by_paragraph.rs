@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::chunk_by_sentence::chunk_by_sentence;
 use crate::cut_type::CutType;
-use crate::token_counter::TokenCounter;
+use crate::token_counter::{TokenCountMode, TokenCounter};
 
 /// A paragraph-level chunk with metadata. Borrows text from the input.
 #[derive(Debug, Clone)]
@@ -35,6 +35,15 @@ pub struct ParagraphChunk<'a> {
 /// - `batch_paragraphs`: if true, accumulates sentences across paragraph
 ///   boundaries until overflow. If false, yields at each paragraph boundary.
 /// - `counter`: token counter implementation
+/// - `mode`: how sizes are measured — see [`TokenCountMode`].
+///
+/// Under [`TokenCountMode::Span`] the accumulation decision still sums the
+/// per-sentence sizes, which over-states the concatenated span by the merges
+/// lost at each sentence boundary (~1 token per sentence). That error is in the
+/// safe direction — it fills chunks slightly under the limit rather than over —
+/// so it is left to drive the decision, while the `chunk_size` each chunk
+/// *reports* is counted from the emitted slice and is exact. `chunk_by_row`
+/// has always worked this way.
 #[allow(
     clippy::expect_used,
     reason = "chunk_start invariants are upheld by the accumulation logic above each emit branch"
@@ -44,8 +53,14 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
     max_chunk_size: usize,
     batch_paragraphs: bool,
     counter: &C,
+    mode: TokenCountMode,
 ) -> Vec<ParagraphChunk<'a>> {
-    let sentences = chunk_by_sentence(data, Some(max_chunk_size), counter);
+    let sentences = chunk_by_sentence(data, Some(max_chunk_size), counter, mode);
+    // Size of an emitted slice, in whichever unit `mode` reports.
+    let emitted_size = |text: &str, accumulated: usize| match mode {
+        TokenCountMode::PerWord => accumulated,
+        TokenCountMode::Span => counter.count_tokens(text),
+    };
     let mut result = Vec::new();
     let mut chunk_index: usize = 0;
     let mut paragraph_ids: Vec<Uuid> = Vec::new();
@@ -59,18 +74,39 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
         let sent_start = sentence.text.as_ptr() as usize - data.as_ptr() as usize;
         let sent_end = sent_start + sentence.text.len();
 
+        // What the accumulator would read once this sentence is taken in.
+        let mut next_size = current_chunk_size + sentence.size;
+
+        // Same two-tier check as `chunk_by_sentence`: summed per-sentence sizes
+        // over-state the span they compose by the merge lost at each boundary
+        // (~1 token per sentence, ~9% of the budget on short prose sentences),
+        // so under `Span` confirm a suspected overflow against the real span
+        // before cutting, and re-baseline the accumulator on a false alarm.
+        let mut overflows = current_chunk_size > 0 && next_size > max_chunk_size;
+        if overflows
+            && mode == TokenCountMode::Span
+            && let Some(start) = chunk_start
+        {
+            let exact_with_sentence = counter.count_tokens(&data[start..sent_end]);
+            if exact_with_sentence <= max_chunk_size {
+                overflows = false;
+                next_size = exact_with_sentence;
+            }
+        }
+
         // Overflow: yield current chunk and start fresh
-        if current_chunk_size > 0 && (current_chunk_size + sentence.size > max_chunk_size) {
+        if overflows {
             let text = &data[chunk_start.expect("chunk_start is Some because current_chunk_size > 0 only after a sentence was accumulated")..chunk_end];
             result.push(ParagraphChunk {
                 text,
-                chunk_size: current_chunk_size,
+                chunk_size: emitted_size(text, current_chunk_size),
                 chunk_id: Uuid::new_v5(&NAMESPACE_OID, text.as_bytes()),
                 paragraph_ids: std::mem::take(&mut paragraph_ids),
                 chunk_index,
                 cut_type: last_cut_type.clone(),
             });
-            current_chunk_size = 0;
+            // `current_chunk_size` is not reset here: the accumulator update
+            // below is unconditional and keys off `overflows`.
             chunk_start = None;
             chunk_index += 1;
         }
@@ -80,7 +116,9 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
             chunk_start = Some(sent_start);
         }
         chunk_end = sent_end;
-        current_chunk_size += sentence.size;
+        // `next_size` was computed against the pre-cut accumulator, so it only
+        // applies when no cut happened; a fresh chunk holds this sentence alone.
+        current_chunk_size = if overflows { sentence.size } else { next_size };
 
         // Non-batch mode: yield at paragraph boundaries
         if !batch_paragraphs
@@ -94,7 +132,7 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
             )..chunk_end];
             result.push(ParagraphChunk {
                 text,
-                chunk_size: current_chunk_size,
+                chunk_size: emitted_size(text, current_chunk_size),
                 chunk_id: Uuid::new_v5(&NAMESPACE_OID, text.as_bytes()),
                 paragraph_ids: std::mem::take(&mut paragraph_ids),
                 chunk_index,
@@ -119,7 +157,7 @@ pub fn chunk_by_paragraph<'a, C: TokenCounter>(
         result.push(ParagraphChunk {
             chunk_id: Uuid::new_v5(&NAMESPACE_OID, text.as_bytes()),
             text,
-            chunk_size: current_chunk_size,
+            chunk_size: emitted_size(text, current_chunk_size),
             paragraph_ids,
             chunk_index,
             cut_type: final_cut_type,
@@ -141,13 +179,19 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        let chunks = chunk_by_paragraph("", 10, true, &WordCounter);
+        let chunks = chunk_by_paragraph("", 10, true, &WordCounter, TokenCountMode::Span);
         assert!(chunks.is_empty());
     }
 
     #[test]
     fn single_short_paragraph() {
-        let chunks = chunk_by_paragraph("Hello world.", 100, true, &WordCounter);
+        let chunks = chunk_by_paragraph(
+            "Hello world.",
+            100,
+            true,
+            &WordCounter,
+            TokenCountMode::Span,
+        );
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hello world.");
         assert_eq!(chunks[0].chunk_size, 2);
@@ -157,7 +201,7 @@ mod tests {
     #[test]
     fn batch_mode_accumulates() {
         let text = "First sentence. Second sentence. Third sentence.";
-        let chunks = chunk_by_paragraph(text, 100, true, &WordCounter);
+        let chunks = chunk_by_paragraph(text, 100, true, &WordCounter, TokenCountMode::Span);
         // Should accumulate all into one chunk
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_size, 6);
@@ -167,7 +211,7 @@ mod tests {
     fn batch_mode_overflow() {
         let text = "One two. Three four. Five six.";
         // Max 3 words: first sentence fits (2), second would overflow (2+2=4>3)
-        let chunks = chunk_by_paragraph(text, 3, true, &WordCounter);
+        let chunks = chunk_by_paragraph(text, 3, true, &WordCounter, TokenCountMode::Span);
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0].chunk_index, 0);
         assert_eq!(chunks[1].chunk_index, 1);
@@ -176,7 +220,7 @@ mod tests {
     #[test]
     fn non_batch_mode_yields_at_paragraph() {
         let text = "First paragraph.\nSecond paragraph.";
-        let chunks = chunk_by_paragraph(text, 100, false, &WordCounter);
+        let chunks = chunk_by_paragraph(text, 100, false, &WordCounter, TokenCountMode::Span);
         // Should yield at each paragraph boundary
         assert!(chunks.len() >= 2);
     }
@@ -184,7 +228,7 @@ mod tests {
     #[test]
     fn sequential_chunk_indices() {
         let text = "A. B. C. D. E.";
-        let chunks = chunk_by_paragraph(text, 2, true, &WordCounter);
+        let chunks = chunk_by_paragraph(text, 2, true, &WordCounter, TokenCountMode::Span);
         for (i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.chunk_index, i);
         }
@@ -193,8 +237,8 @@ mod tests {
     #[test]
     fn deterministic_ids() {
         let text = "Hello world. Foo bar.";
-        let chunks1 = chunk_by_paragraph(text, 100, true, &WordCounter);
-        let chunks2 = chunk_by_paragraph(text, 100, true, &WordCounter);
+        let chunks1 = chunk_by_paragraph(text, 100, true, &WordCounter, TokenCountMode::Span);
+        let chunks2 = chunk_by_paragraph(text, 100, true, &WordCounter, TokenCountMode::Span);
         assert_eq!(chunks1[0].chunk_id, chunks2[0].chunk_id);
     }
 
@@ -206,7 +250,7 @@ mod tests {
                      The rain in Spain falls mainly on the plain. A stitch in time saves nine. An apple a day keeps the doctor away.\n\
                      To be or not to be that is the question. All that glitters is not gold. Actions speak louder than words. The pen is mightier than the sword. Knowledge is power above all else.";
         let counter = WordCounter;
-        let chunks = chunk_by_paragraph(input, 12, true, &counter);
+        let chunks = chunk_by_paragraph(input, 12, true, &counter, TokenCountMode::Span);
 
         // With max_chunk_size=12 and batch_paragraphs=true, the text is split
         // into multiple chunks by overflow. Each chunk respects the 12-word limit.
@@ -243,7 +287,7 @@ mod tests {
                      The rain in Spain falls mainly on the plain. A stitch in time saves nine. An apple a day keeps the doctor away.\n\
                      To be or not to be that is the question. All that glitters is not gold. Actions speak louder than words. The pen is mightier than the sword. Knowledge is power above all else";
         let counter = WordCounter;
-        let chunks = chunk_by_paragraph(input, 12, true, &counter);
+        let chunks = chunk_by_paragraph(input, 12, true, &counter, TokenCountMode::Span);
 
         assert!(chunks.len() >= 2, "expected at least 2 chunks");
 

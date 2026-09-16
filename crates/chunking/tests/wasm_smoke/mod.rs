@@ -11,7 +11,7 @@
 //! file lives in a `tests/` subdirectory, so cargo does not treat it as its own
 //! test target — it is only compiled when `mod`-included by a wasm test file.
 
-use cognee_chunking::{NAMESPACE_OID, TokenCounter, WordCounter, chunk_text};
+use cognee_chunking::{NAMESPACE_OID, TokenCountMode, TokenCounter, WordCounter, chunk_text};
 
 pub fn word_counter() {
     assert_eq!(WordCounter.count_tokens("hello wasm world"), 3);
@@ -26,7 +26,7 @@ pub fn chunk_text_smoke() {
     let text = "First paragraph of the spike.\n\n\
                 Second paragraph has a few more words than the first one does.";
 
-    let chunks = chunk_text(doc, text, 8, &counter);
+    let chunks = chunk_text(doc, text, 8, &counter, TokenCountMode::Span);
 
     assert!(!chunks.is_empty(), "expected at least one chunk");
     for (i, c) in chunks.iter().enumerate() {

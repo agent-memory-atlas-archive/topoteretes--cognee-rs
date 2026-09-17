@@ -54,7 +54,19 @@ impl DatasetManager {
     /// List all datasets accessible to the given owner.
     ///
     /// When ACL is configured, only datasets the owner has "read" permission
-    /// on are returned. Without ACL, all datasets owned by the user are listed.
+    /// on are returned — the grants are the whole answer, including when they
+    /// are empty. Without ACL, every dataset owned by the user is listed.
+    ///
+    /// **Not tenant-scoped, on either path.** Python filters both by
+    /// `dataset.tenant_id == user.tenant_id`
+    /// (`get_all_user_permission_datasets.py`), and `GET /v1/datasets` applies
+    /// that predicate to its ownership path (SDK-637). This facade cannot:
+    /// `owner_id` is the only principal it is given, and no in-tree caller has
+    /// a tenant to pass — `bindings-common`'s handle pins `tenant_id: None` and
+    /// the CLI never sets one. So the divergence is latent rather than live,
+    /// and closing it means giving the callers a tenant first, not adding a
+    /// parameter nothing can fill. Callers that do know their tenant can
+    /// filter the returned rows on `Dataset::tenant_id`.
     pub async fn list_datasets(&self, owner_id: Uuid) -> Result<Vec<Dataset>, DatasetError> {
         if let Some(acl) = &self.acl_db {
             let authorized_ids = acl

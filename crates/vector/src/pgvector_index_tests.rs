@@ -133,7 +133,7 @@ async fn backfill_indexes_pre_existing_collections_and_is_idempotent() {
                 .unwrap();
             assert!(!index_present(&db, "Old_f_vector_hnsw").await);
 
-            let created = adapter.create_missing_vector_indexes().await.unwrap();
+            let created = adapter.create_missing_vector_indexes().await.unwrap().built;
             assert_eq!(
                 created, 1,
                 "only the indexable collection counts — the 3072-d one is skipped"
@@ -141,7 +141,7 @@ async fn backfill_indexes_pre_existing_collections_and_is_idempotent() {
             assert!(index_present(&db, "Old_f_vector_hnsw").await);
 
             // Idempotent: nothing left to do, and nothing recounted.
-            let again = adapter.create_missing_vector_indexes().await.unwrap();
+            let again = adapter.create_missing_vector_indexes().await.unwrap().built;
             assert_eq!(
                 again, 0,
                 "a second run must report no work, not re-count existing indexes"
@@ -149,6 +149,43 @@ async fn backfill_indexes_pre_existing_collections_and_is_idempotent() {
 
             drop(db);
             adapter.close().await.unwrap();
+        },
+    )
+    .await;
+}
+
+/// The CLI holds an `Arc<dyn VectorDB>` and never learns which backend it was
+/// handed, so the backfill has to be reachable through the trait. Calling the
+/// inherent function is what every other case here does and would pass even if
+/// the trait method were left on its `Ok(0)` default — which would make
+/// `cognee-cli vector-reindex` silently report no work on every store.
+#[tokio::test]
+async fn backfill_is_reachable_through_the_trait_object() {
+    with_temp_db(
+        "backfill_is_reachable_through_the_trait_object",
+        |url| async move {
+            let adapter = PgVectorAdapter::new(&url, 8).await.unwrap();
+            adapter.create_collection("Dyn", "f", 8).await.unwrap();
+
+            let db = Database::connect(&url).await.unwrap();
+            // Simulate a collection whose best-effort index build failed.
+            db.execute_unprepared(r#"DROP INDEX "Dyn_f_vector_hnsw""#)
+                .await
+                .unwrap();
+            assert!(!index_present(&db, "Dyn_f_vector_hnsw").await);
+
+            // Erased exactly as the CLI holds it.
+            let erased: std::sync::Arc<dyn VectorDB> = std::sync::Arc::new(adapter);
+            let created = erased.create_missing_vector_indexes().await.unwrap().built;
+
+            assert_eq!(
+                created, 1,
+                "the trait method must delegate to the adapter, not return the Ok(0) default"
+            );
+            assert!(index_present(&db, "Dyn_f_vector_hnsw").await);
+
+            drop(db);
+            erased.close().await.unwrap();
         },
     )
     .await;
@@ -196,7 +233,7 @@ async fn backfill_replaces_an_invalid_index_left_by_a_failed_build() {
                 "an invalid index must not count as usable — the planner ignores it"
             );
 
-            let created = adapter.create_missing_vector_indexes().await.unwrap();
+            let created = adapter.create_missing_vector_indexes().await.unwrap().built;
             assert_eq!(created, 1, "the invalid index must be rebuilt, not skipped");
             assert!(
                 index_present(&db, "Broken_f_vector_hnsw").await,
@@ -307,7 +344,7 @@ async fn a_collection_name_past_the_identifier_limit_is_still_tracked() {
 
             // The regression: with an untruncated name the probe finds nothing,
             // so this reports 1 on every run instead of 0.
-            let again = adapter.create_missing_vector_indexes().await.unwrap();
+            let again = adapter.create_missing_vector_indexes().await.unwrap().built;
             assert_eq!(
                 again, 0,
                 "a long-named collection is already indexed; re-counting it means \

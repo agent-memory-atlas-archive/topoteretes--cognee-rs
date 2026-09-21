@@ -67,7 +67,7 @@ pub struct CogneeServices {
 }
 
 /// Relational databases this process has already considered for a startup
-/// recovery sweep, keyed by resolved URL.
+/// recovery sweep, keyed by a hash of the resolved URL.
 ///
 /// Per database, not a single process-wide flag: one process can build
 /// services against more than one relational URL (a test harness, an embedder
@@ -79,7 +79,11 @@ pub struct CogneeServices {
 /// into the same dataset — the exact failure the claim prevents. The only
 /// moment at which every leftover in a database is provably dead is the first
 /// time this process touches it.
-static SWEPT_DATABASES: std::sync::Mutex<std::collections::BTreeSet<String>> =
+///
+/// Hashed rather than stored verbatim because a Postgres URL carries its
+/// password, and this set lives for the whole process. Nothing ever reads a
+/// URL back out of it — the only question asked is "seen before?".
+static SWEPT_DATABASES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Record `relational_db_url` as considered, reporting whether this call is
@@ -91,6 +95,16 @@ static SWEPT_DATABASES: std::sync::Mutex<std::collections::BTreeSet<String>> =
 /// a config change flipped the flag or repointed the URL — would sweep with
 /// this process's own runs already in flight.
 fn claim_first_touch(relational_db_url: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+
+    // A process-local dedup key, not a security boundary and not persisted, so
+    // `DefaultHasher` is enough. A collision between two URLs in one process
+    // would skip a sweep rather than perform an extra one — the conservative
+    // direction, and the same outcome as not asserting single-process.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    relational_db_url.hash(&mut hasher);
+    let key = hasher.finish();
+
     let mut swept = match SWEPT_DATABASES.lock() {
         Ok(guard) => guard,
         // A panic in another holder says nothing about this set's contents:
@@ -100,7 +114,7 @@ fn claim_first_touch(relational_db_url: &str) -> bool {
         // panic on every later build.
         Err(poisoned) => poisoned.into_inner(),
     };
-    swept.insert(relational_db_url.to_string())
+    swept.insert(key)
 }
 
 /// Clear what a killed run left behind on this database — once per database

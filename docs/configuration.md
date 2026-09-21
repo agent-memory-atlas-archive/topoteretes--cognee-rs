@@ -500,20 +500,35 @@ config (see [roadmap/cognify-compatibility-plan.md](roadmap/cognify-compatibilit
 | `DB_HOST` / `DB_PORT` | `db_host` / `db_port` | `localhost` / `5432` |
 | `DB_NAME` | `db_name` | `cognee_db` |
 | `DB_USERNAME` / `DB_PASSWORD` | … | _(empty)_ |
-| `COGNEE_SINGLE_PROCESS` | `single_process` | _(derived)_ |
+| `COGNEE_SINGLE_PROCESS` | `single_process` | _(unset — see below; effectively off)_ |
 
-### `COGNEE_SINGLE_PROCESS` — does one process own this database?
+### `single_process` / `COGNEE_SINGLE_PROCESS` — does one process own this database?
 
-Unset, empty or whitespace-only means "derive it", and the derivation is
-deliberately narrow: **only an in-memory SQLite URL** (`sqlite::memory:`,
-`?mode=memory`) resolves to `true`, because no second process can open one.
-Everything else resolves to `false` — Postgres, and **file-backed SQLite
-including the shipped default `sqlite:./cognee.db?mode=rwc`**, which every
-cognee process started in that directory opens.
+**In practice this is an opt-in: startup recovery does nothing until you turn
+it on.** The setting is tri-state, and the derived answer is only ever useful
+in the negative:
 
-Any other value is an explicit answer (truthy per `true` / `1` / `yes` / `on`,
-anything else `false`) and overrides the derivation in either direction.
-`Settings::resolved_single_process()` is what reads it.
+| value | meaning |
+|---|---|
+| unset / `null` | derive it — see below |
+| `true` (`1`, `yes`, `on`) | one process owns this database; enable startup recovery |
+| any other non-blank value | explicitly not; leave everything alone |
+
+Set it programmatically with `cognee config set single_process true`, through
+any binding's `set_config("single_process", true)`, or in Rust with
+`ConfigManager::set_single_process(true)`. `null` restores the derived answer
+the way it does for `chunk_size`. The env var is parsed by the same code as the
+config key, so the two cannot disagree — a blank or whitespace-only value means
+"derive", not `false`.
+
+The derivation resolves `true` for **only an in-memory SQLite URL**
+(`sqlite::memory:`, `?mode=memory`) and `false` for everything else — Postgres,
+and **file-backed SQLite including the shipped default
+`sqlite:./cognee.db?mode=rwc`**, which every cognee process started in that
+directory opens. Since an in-memory database dies with its process, it can
+never hold a leftover from a dead run, so the derived `true` gives the sweep
+nothing to do. The derivation earns its place through the `false` half, which
+is what stops a SQLite *file* from being mistaken for a private one.
 
 #### What asserting it turns on
 
@@ -530,20 +545,20 @@ dead predecessor, so both are cleared and the dataset is runnable again. With
 more than one, either may belong to a live peer, so nothing is cleared and the
 claim keeps excluding concurrent runs across processes exactly as before.
 
-#### You must opt in on file-backed SQLite
+#### Who needs to set it
 
-An embedded single-process consumer on a SQLite **file** — an Android app, a
-desktop app, a one-process service — has to set `COGNEE_SINGLE_PROCESS=1` (or
-`Settings::single_process = Some(true)`) to get this recovery. The URL alone
-cannot show it: the same URL is what two `cognee-cli` invocations, or an HTTP
-server restarting beside a running CLI, would use, and sweeping there would
-delete a live sibling's claim and admit the concurrent run the claim exists to
-prevent. Without the opt-in the pre-existing behaviour is unchanged — the claim
-still ages out after 24 h, and the orphaned row is still cleared by
+Any single-process deployment on a **file-backed** database: an Android app, a
+desktop app, a one-process service, a CLI-only setup. The URL cannot show this
+— the very same URL is what two `cognee-cli` invocations, or an HTTP server
+restarting beside a running CLI, would use, and sweeping there would delete a
+live sibling's claim and admit the concurrent run the claim exists to prevent.
+
+Without the opt-in nothing regresses; you simply keep today's behaviour. The
+claim still ages out after 24 h, and the orphaned row is still cleared by
 `cognee-cli pipeline-unblock --clear` or by an HTTP-server restart.
 
-Conversely, set it to `0` if two processes really do share one in-memory
-database through `cache=shared`.
+Set it to `false` to refuse the recovery outright — useful to pin the safe
+behaviour in a config file so a later environment change cannot switch it on.
 
 ## Chunking & tokenizer
 

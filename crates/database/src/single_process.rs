@@ -27,8 +27,8 @@ pub const SINGLE_PROCESS_ENV: &str = "COGNEE_SINGLE_PROCESS";
 /// The single-process assertion derived from the relational DB URL alone.
 ///
 /// **Only an in-memory SQLite database derives `true`.** Such a database is
-/// private to the handle that opened it: no second process can see it, so
-/// there is provably no peer whose state a startup sweep could destroy.
+/// private to the process that opened it: no peer can see it, so there is
+/// provably nobody whose state a startup sweep could destroy.
 ///
 /// Everything else derives `false`, **file-backed SQLite included**. This is
 /// the case that is easy to get wrong: the shipped default relational URL is
@@ -39,9 +39,21 @@ pub const SINGLE_PROCESS_ENV: &str = "COGNEE_SINGLE_PROCESS";
 /// delete a live sibling's claim — re-admitting exactly the concurrent run the
 /// claim exists to prevent.
 ///
-/// A deployment that really does own its SQLite file, such as an app with one
-/// process per device, asserts it explicitly with `COGNEE_SINGLE_PROCESS=1`.
-/// The SDK cannot infer that from the URL, and guessing is not safe.
+/// # The `true` branch is inert, and that is fine
+///
+/// An in-memory database dies with its process, so it can never *hold* a
+/// leftover from a dead run: after a kill the next process opens an empty one.
+/// The derived `true` therefore never gives the sweep anything to do, and in
+/// practice **the sweep runs only under an explicit opt-in**
+/// (`COGNEE_SINGLE_PROCESS=1` / `single_process = true`).
+///
+/// The value here is the `false` half. It is the H2 regression — "SQLite
+/// implies single process" — in executable form, guarded by
+/// `file_backed_sqlite_does_not_derive_single_process` below, and it is the
+/// predicate any future caller asking "may I clear shared state at startup?"
+/// should reach for rather than re-deriving badly. (The HTTP server's
+/// unconditional `reset_orphans`, which still runs for multi-replica Postgres,
+/// is the next candidate.)
 pub fn single_process_default(relational_db_url: &str) -> bool {
     sqlite_url_is_in_memory(relational_db_url)
 }
@@ -142,12 +154,11 @@ mod tests {
             "sqlite:./cognee.db?mode=rwc",
             Some(true)
         ));
-        // And the opt-out: two processes really do share one in-memory
-        // database through `cache=shared`, so the claim must keep working.
-        assert!(!resolve_single_process(
-            "sqlite:file::memory:?cache=shared",
-            Some(false)
-        ));
+        // And the opt-out, which must work even on a URL the derivation would
+        // have said `true` to: an explicit answer is always the last word, so
+        // an operator can switch startup recovery off without changing the
+        // database they point at.
+        assert!(!resolve_single_process("sqlite::memory:", Some(false)));
     }
 
     #[test]

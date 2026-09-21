@@ -447,8 +447,12 @@ pub struct Settings {
     /// leftover belongs to a dead predecessor; with more than one it may
     /// belong to a live peer and must not be touched.
     ///
-    /// An embedded consumer that owns its SQLite file — one process per
-    /// device, say — has to say so: the SDK cannot tell that from the URL.
+    /// In practice this is an **opt-in**: the only URL that derives `true` is
+    /// an in-memory database, which dies with its process and so can never
+    /// hold a leftover to clear. Every real deployment that wants the recovery
+    /// sets this — `cognee config set single_process true`, a binding's
+    /// `set_config`, [`ConfigManager::set_single_process`], or
+    /// `COGNEE_SINGLE_PROCESS=1`.
     pub single_process: Option<bool>,
 }
 
@@ -1760,6 +1764,28 @@ impl ConfigManager {
         self.bump_version();
     }
 
+    /// Assert (or deny) that exactly one process uses the relational database.
+    ///
+    /// The programmatic form of `COGNEE_SINGLE_PROCESS`, and the one an
+    /// embedded consumer needs: the Python, C, TS and Java bindings configure
+    /// through `set_config`, and an app that owns its SQLite file has no other
+    /// way to say so. See [`Settings::single_process`] for what it enables.
+    pub fn set_single_process(&self, single_process: bool) {
+        let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        s.single_process = Some(single_process);
+        drop(s);
+        self.bump_version();
+    }
+
+    /// Restore the derived answer (`single_process = None`), the counterpart of
+    /// [`Self::set_single_process`].
+    pub fn clear_single_process(&self) {
+        let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        s.single_process = None;
+        drop(s);
+        self.bump_version();
+    }
+
     /// Set all relational DB connection fields at once.
     // Many optional fields are needed here to match Python's bulk-setter API.
     #[allow(clippy::too_many_arguments)]
@@ -2281,6 +2307,13 @@ impl ConfigManager {
             Value::String(mask_url(&s.relational_db_url)),
         );
         m.insert("db_password".into(), Value::String(mask(&s.db_password)));
+        m.insert(
+            "single_process".into(),
+            // `null` = derived from the relational URL, not "false". The
+            // difference is load-bearing: `false` is an operator refusing the
+            // startup sweep, `null` is nobody having said anything.
+            s.single_process.map_or(Value::Null, Value::Bool),
+        );
 
         // Paths
         m.insert(
@@ -2610,6 +2643,22 @@ impl ConfigManager {
             "relational_db_url" => {
                 self.set_relational_db_url(as_string(key, &value)?.as_str());
             }
+            // `null` restores the derived answer, exactly as it does for
+            // `chunk_size` and `llm_temperature`.
+            "single_process" if value.is_null() => self.clear_single_process(),
+            // A string goes through the same parser the env var uses, so a
+            // binding passing `"1"` and `COGNEE_SINGLE_PROCESS=1` cannot mean
+            // different things — and a blank string means "derive", matching
+            // `null` above rather than reading as a silent `false`.
+            "single_process" if value.is_string() => {
+                match cognee_database::parse_single_process_override(
+                    as_string(key, &value)?.as_str(),
+                ) {
+                    Some(v) => self.set_single_process(v),
+                    None => self.clear_single_process(),
+                }
+            }
+            "single_process" => self.set_single_process(as_bool(key, &value)?),
             "migration_db_url" => {
                 self.set_migration_db_config(as_string(key, &value)?.as_str());
             }
@@ -2853,6 +2902,88 @@ mod tests {
 
         cm.set_llm_network_retries(7);
         assert_eq!(cm.read().llm_network_retries, 7);
+    }
+
+    /// The same class of gap as the test above, for `single_process`.
+    ///
+    /// It shipped in review as env-var-only: the docs told embedders to set
+    /// `Settings::single_process`, and the generic dispatcher every binding
+    /// goes through answered `UnknownKey`. Since the whole point of the
+    /// setting is to let an embedded consumer — Python, C, TS, Java — opt into
+    /// startup recovery, env-only made it unreachable for its own audience.
+    #[test]
+    fn single_process_is_reachable_from_every_config_entry_point() {
+        let cm = ConfigManager::new(Settings::default());
+        assert_eq!(cm.read().single_process, None, "unset by default");
+
+        cm.set("single_process", serde_json::json!(true))
+            .expect("the generic dispatcher must accept a bool");
+        assert_eq!(cm.read().single_process, Some(true));
+
+        cm.set("single_process", serde_json::json!(false))
+            .expect("and the other way");
+        assert_eq!(cm.read().single_process, Some(false));
+
+        // `null` restores the derivation, like `chunk_size` / `llm_temperature`.
+        cm.set("single_process", serde_json::Value::Null)
+            .expect("null must clear it, not fail");
+        assert_eq!(cm.read().single_process, None);
+
+        cm.set_single_process(true);
+        assert_eq!(cm.read().single_process, Some(true));
+        cm.clear_single_process();
+        assert_eq!(cm.read().single_process, None);
+    }
+
+    /// A string value must mean exactly what the same text means in
+    /// `COGNEE_SINGLE_PROCESS`, including the blank case — the two parsers
+    /// disagreeing on whitespace is the bug this shares a parser to prevent.
+    #[test]
+    fn single_process_strings_parse_as_the_env_var_does() {
+        let cm = ConfigManager::new(Settings::default());
+
+        for truthy in ["1", "true", " yes ", "ON"] {
+            cm.set("single_process", serde_json::json!(truthy))
+                .expect("truthy string");
+            assert_eq!(
+                cm.read().single_process,
+                Some(true),
+                "{truthy:?} must read as true"
+            );
+        }
+        for falsy in ["0", "no", "off", "maybe"] {
+            cm.set("single_process", serde_json::json!(falsy))
+                .expect("falsy string");
+            assert_eq!(
+                cm.read().single_process,
+                Some(false),
+                "{falsy:?} must read as an explicit false"
+            );
+        }
+        // Blank is "no answer given", not a silent `false` — the same
+        // whitespace case both env paths now agree on.
+        cm.set_single_process(true);
+        cm.set("single_process", serde_json::json!("   "))
+            .expect("blank string");
+        assert_eq!(cm.read().single_process, None, "blank means derive");
+    }
+
+    /// The config snapshot must keep "derived" and "explicitly false" apart —
+    /// reporting `false` for an unset value would tell an operator the sweep
+    /// was refused when nobody had said anything.
+    #[test]
+    fn single_process_snapshot_distinguishes_null_from_false() {
+        let cm = ConfigManager::new(Settings::default());
+        assert_eq!(
+            cm.get_settings().get("single_process"),
+            Some(&serde_json::Value::Null)
+        );
+
+        cm.set_single_process(false);
+        assert_eq!(
+            cm.get_settings().get("single_process"),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 
     #[test]

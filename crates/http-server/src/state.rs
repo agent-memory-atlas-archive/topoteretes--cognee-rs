@@ -195,9 +195,15 @@ impl AppState {
             .await
             {
                 Ok(r) => r,
-                Err(e) => {
+                Err(_) => {
+                    // The error is deliberately not repeated here:
+                    // `new_with_orphan_reset` already logged which of its two
+                    // startup steps failed and why, and echoing it made the
+                    // server report one failure twice. What this line adds is
+                    // the consequence — the registry is built without them.
                     tracing::warn!(
-                        "pipeline registry startup orphan-reset failed (non-fatal): {e}"
+                        "continuing without startup pipeline-run recovery (non-fatal); see the \
+                         warning above for which step failed"
                     );
                     // Fall back to plain new() without reset.
                     let repo2 = Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&db)))

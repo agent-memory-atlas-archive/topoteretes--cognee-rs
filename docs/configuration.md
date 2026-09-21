@@ -504,25 +504,46 @@ config (see [roadmap/cognify-compatibility-plan.md](roadmap/cognify-compatibilit
 
 ### `COGNEE_SINGLE_PROCESS` — does one process own this database?
 
-Unset (the default) means "derive it": a SQLite relational URL is taken as
-single-process, anything else — Postgres above all — is not. Any non-empty
-value is an explicit answer (truthy per `true` / `1` / `yes` / `on`, anything
-else `false`), so the derivation can be overridden in either direction.
+Unset, empty or whitespace-only means "derive it", and the derivation is
+deliberately narrow: **only an in-memory SQLite URL** (`sqlite::memory:`,
+`?mode=memory`) resolves to `true`, because no second process can open one.
+Everything else resolves to `false` — Postgres, and **file-backed SQLite
+including the shipped default `sqlite:./cognee.db?mode=rwc`**, which every
+cognee process started in that directory opens.
+
+Any other value is an explicit answer (truthy per `true` / `1` / `yes` / `on`,
+anything else `false`) and overrides the derivation in either direction.
 `Settings::resolved_single_process()` is what reads it.
 
-Asserting it enables recovery that is only sound with no peer process, above
-all the startup sweep of `pipeline_run_claims`. A cognify/memify holds an
-exclusive-run claim on its `(dataset, pipeline)` pair, and only the holder can
-release it — so a run killed mid-flight (SIGKILL, OOM, an Android process
-kill) leaves a claim behind that refuses every later run on that dataset until
-it ages out 24 h later. With one process per database, every claim present at
-startup belongs to a dead predecessor and is cleared; with more than one it
-may belong to a live peer, so nothing is cleared and the claim keeps excluding
-concurrent runs across processes exactly as before.
+#### What asserting it turns on
 
-Turn it **off** on a SQLite file two cognee processes really do share
-(unsupported, but reachable). Turn it **on** for a single-process deployment
-that happens to use Postgres and wants the same crash recovery.
+Startup recovery for a run killed mid-flight — SIGKILL, an OOM kill, Android
+killing the app process. Such a run wedges its dataset behind two gates that
+its dead holder cannot clear:
+
+- the `pipeline_runs` row left at `Started`, read first and **never** expiring;
+- the exclusive-run claim on `(dataset, pipeline)`, released only by the holder
+  and otherwise expiring 24 h later.
+
+With one process per database, both leftovers present at startup belong to a
+dead predecessor, so both are cleared and the dataset is runnable again. With
+more than one, either may belong to a live peer, so nothing is cleared and the
+claim keeps excluding concurrent runs across processes exactly as before.
+
+#### You must opt in on file-backed SQLite
+
+An embedded single-process consumer on a SQLite **file** — an Android app, a
+desktop app, a one-process service — has to set `COGNEE_SINGLE_PROCESS=1` (or
+`Settings::single_process = Some(true)`) to get this recovery. The URL alone
+cannot show it: the same URL is what two `cognee-cli` invocations, or an HTTP
+server restarting beside a running CLI, would use, and sweeping there would
+delete a live sibling's claim and admit the concurrent run the claim exists to
+prevent. Without the opt-in the pre-existing behaviour is unchanged — the claim
+still ages out after 24 h, and the orphaned row is still cleared by
+`cognee-cli pipeline-unblock --clear` or by an HTTP-server restart.
+
+Conversely, set it to `0` if two processes really do share one in-memory
+database through `cache=shared`.
 
 ## Chunking & tokenizer
 

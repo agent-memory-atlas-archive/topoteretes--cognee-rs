@@ -66,59 +66,115 @@ pub struct CogneeServices {
     pub checkpoint_store: Arc<dyn CheckpointStore>,
 }
 
-/// Has this *process* already swept the exclusive-run claims?
+/// Relational databases this process has already considered for a startup
+/// recovery sweep, keyed by resolved URL.
 ///
-/// Deliberately a process-global, not per handle and not per config version.
-/// `CogneeServices::build` runs again whenever the config version changes, and
-/// by then a cognify started through an earlier handle may be holding a claim
-/// that is very much alive. Sweeping then would drop it and let a second run
+/// Per database, not a single process-wide flag: one process can build
+/// services against more than one relational URL (a test harness, an embedder
+/// switching tenants), and a bare flag would recover the first and silently
+/// skip every other. Per *process* and not per handle or per config version,
+/// because `CogneeServices::build` runs again on every config-version change,
+/// and by then a cognify started through an earlier handle may hold a claim
+/// that is very much alive. Sweeping then would drop it and admit a second run
 /// into the same dataset — the exact failure the claim prevents. The only
-/// moment at which every claim in the database is provably dead is the first
-/// build in a fresh process, so the sweep happens there and nowhere else.
-static CLAIMS_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// moment at which every leftover in a database is provably dead is the first
+/// time this process touches it.
+static SWEPT_DATABASES: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Release claims left behind by a killed predecessor — once per process, and
-/// only where the deployment asserts one process per relational database.
+/// Record `relational_db_url` as considered, reporting whether this call is
+/// the first to do so.
 ///
-/// A run killed mid-flight (SIGKILL, OOM, an Android process kill) cannot
-/// release its claim: `release_pipeline_run_claim` filters on the holder's
-/// `claim_id`, which died with it. Liveness is then inferred from the age of
-/// the claim against a day-long staleness window, so the dataset refuses every
-/// new cognify/memify until that window expires. The status-row gate has a
-/// reset an embedder can call (`reset_dataset_pipeline_run_status`); the claim
-/// has none outside the CLI, which an embedded consumer does not have. This
-/// closes that gap.
+/// Deliberately called *before* the single-process assertion is consulted.
+/// Marking only on the sweeping path would leave a database unmarked when the
+/// first build resolves `false`, so a later build that resolves `true` — after
+/// a config change flipped the flag or repointed the URL — would sweep with
+/// this process's own runs already in flight.
+fn claim_first_touch(relational_db_url: &str) -> bool {
+    let mut swept = match SWEPT_DATABASES.lock() {
+        Ok(guard) => guard,
+        // A panic in another holder says nothing about this set's contents:
+        // the only mutation is one `insert`, so the worst a poisoned lock can
+        // mean is that the insert did or did not happen. Recovering keeps the
+        // "at most one sweep" guarantee; propagating would turn it into a
+        // panic on every later build.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    swept.insert(relational_db_url.to_string())
+}
+
+/// Clear what a killed run left behind on this database — once per database
+/// per process, and only where the deployment asserts one process per
+/// relational database.
 ///
-/// Safety: an unscoped release is sound **only** where no peer process can
-/// hold a claim. With one process per database, every claim present at the
-/// first build of a fresh process was written by a dead incarnation of that
-/// same process. A multi-process or multi-replica deployment derives `false`
-/// (non-SQLite relational URL) and is left entirely alone — its claims keep
-/// excluding concurrent runs. `COGNEE_SINGLE_PROCESS` overrides the derivation
-/// in either direction.
+/// A run killed mid-flight (SIGKILL, OOM, an Android process kill) wedges its
+/// dataset behind **two** independent gates, and clearing one alone is worth
+/// nothing:
 ///
-/// Best-effort: a failure here is logged and ignored. The sweep is a recovery
-/// convenience, and refusing to build the SDK because it did not work would
-/// turn a recoverable wedge into a hard startup failure.
-async fn sweep_stale_pipeline_run_claims(
+/// 1. The `pipeline_runs` row left at `Initiated`/`Started`.
+///    `check_pipeline_run_qualification` reads it *first*, before any claim is
+///    consulted, and returns `AlreadyRunning`. It never expires. Until this
+///    landed, the only sweep that retired it ran at HTTP-server startup, so an
+///    embedded consumer never reached it at all.
+/// 2. The exclusive-run claim. Released only by its holder
+///    (`release_pipeline_run_claim` filters on the `claim_id` that died with
+///    it), so liveness is inferred from age against a day-long window.
+///
+/// `cognee-cli pipeline-unblock` clears both for the same reason, and says so
+/// in its own module docs. An embedded consumer has neither that CLI nor an
+/// HTTP server.
+///
+/// Safety: both clears are unscoped, so both are sound **only** where no peer
+/// process can hold what they drop. With one process per database, every
+/// leftover present the first time this process touches it was written by a
+/// dead incarnation of this same process. Anything else — a shared Postgres,
+/// or the *file-backed* SQLite that is the shipped default — derives `false`
+/// and is left entirely alone. `COGNEE_SINGLE_PROCESS` is how a deployment
+/// that does own its file (one process per device, say) opts in; the SDK
+/// cannot infer that from the URL.
+///
+/// The two steps are attempted independently: a transient failure on one must
+/// not suppress the other, since the dataset stays wedged unless both go.
+/// Both are best-effort — a failure is logged and ignored, because refusing to
+/// build the SDK over a recovery convenience would turn a recoverable wedge
+/// into a hard startup failure.
+async fn sweep_killed_run_leftovers(
     cm: &ComponentManager,
     pipeline_run_repo: &Arc<dyn PipelineRunRepository>,
 ) {
     // Snapshot under the read guard and drop it before the `.await`:
     // `RwLockReadGuard` is `!Send`, and this future is awaited from PyO3
     // bindings that require `Send`.
-    let single_process = {
+    let (relational_db_url, single_process) = {
         let settings = cm.settings();
-        settings.resolved_single_process()
+        (
+            settings.resolved_relational_db_url(),
+            settings.resolved_single_process(),
+        )
     };
+
+    // Marked first, assertion checked second — see `claim_first_touch`.
+    if !claim_first_touch(&relational_db_url) {
+        return;
+    }
     if !single_process {
         return;
     }
 
-    // `swap` rather than load-then-store, so two concurrent first builds
-    // cannot both decide they are the sweeper.
-    if CLAIMS_SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+    match pipeline_run_repo
+        .reset_orphans("sdk_startup_orphan_single_process")
+        .await
+    {
+        Ok(0) => {}
+        Ok(reset) => tracing::warn!(
+            reset,
+            "retired pipeline-run rows left in flight by a previous process; the datasets \
+             they blocked are runnable again"
+        ),
+        Err(e) => tracing::warn!(
+            "startup reset of orphaned pipeline runs failed (non-fatal); a dataset wedged by \
+             a killed run stays wedged, and this gate never expires: {e}"
+        ),
     }
 
     match pipeline_run_repo
@@ -128,8 +184,7 @@ async fn sweep_stale_pipeline_run_claims(
         Ok(0) => {}
         Ok(released) => tracing::warn!(
             released,
-            "released pipeline-run claims left behind by a previous process; the datasets \
-             they held are runnable again"
+            "released pipeline-run claims left behind by a previous process"
         ),
         Err(e) => tracing::warn!(
             "startup sweep of pipeline-run claims failed (non-fatal); a dataset wedged by a \
@@ -186,7 +241,7 @@ impl CogneeServices {
         let pipeline_run_repo: Arc<dyn PipelineRunRepository> =
             Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&database)));
 
-        sweep_stale_pipeline_run_claims(cm, &pipeline_run_repo).await;
+        sweep_killed_run_leftovers(cm, &pipeline_run_repo).await;
 
         let add_pipeline = Arc::new(
             AddPipeline::new(

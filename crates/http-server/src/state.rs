@@ -173,13 +173,17 @@ impl AppState {
         let registry_cfg = config.to_registry_config();
 
         // Clearing claims is sound only with no peer process: a claim is
-        // released by its holder alone, so at startup in a single-process
-        // deployment every surviving claim belongs to a dead predecessor.
-        // A multi-replica server shares a Postgres, derives `false` here, and
-        // is untouched — its claims keep excluding concurrent runs across
-        // replicas exactly as before. `COGNEE_SINGLE_PROCESS` overrides the
-        // derivation in either direction.
-        let sweep_claims = cognee_utils::env::single_process_from_env(&config.relational_db_url);
+        // released by its holder alone, so where one process owns the database
+        // every surviving claim at startup belongs to a dead predecessor.
+        //
+        // The derivation is deliberately narrow — only in-memory SQLite, which
+        // no other process can open, qualifies on its own. This server's own
+        // default is a SQLite *file*, which `cognee-cli` or a second server can
+        // open at the same time, and a multi-replica deployment shares a
+        // Postgres; both derive `false` here and keep cross-process exclusion
+        // exactly as before. `COGNEE_SINGLE_PROCESS` is how a single-process
+        // deployment asserts what the URL cannot show.
+        let sweep_claims = cognee_database::single_process_from_env(&config.relational_db_url);
 
         // Run orphan reset on startup (best-effort — non-fatal).
         let pipelines: Arc<dyn PipelineRunRegistry> =

@@ -98,23 +98,45 @@ impl DefaultPipelineRunRegistry {
     ///
     /// Both steps run before the registry exists, so no run of this process
     /// can have taken a claim yet.
+    ///
+    /// They are also attempted **independently**. A dataset wedged by a kill
+    /// is refused by both gates at once, so clearing one and skipping the
+    /// other leaves it wedged either way; letting a transient failure on the
+    /// first suppress the second would turn a recoverable database blip into
+    /// exactly the outcome this is here to prevent. Each outcome is logged on
+    /// its own, and the first error is returned once both have been tried.
     pub async fn new_with_orphan_reset(
         repo: Arc<dyn PipelineRunRepository>,
         cfg: RegistryConfig,
         sweep_claims: bool,
     ) -> Result<Arc<Self>, RegistryError> {
-        repo.reset_orphans("server_restart_orphan").await?;
-        if sweep_claims {
-            let released = repo
-                .release_all_pipeline_run_claims("startup_sweep_single_process")
-                .await?;
-            if released > 0 {
-                tracing::warn!(
-                    released,
-                    "startup released pipeline-run claims left by a previous process"
-                );
-            }
+        let orphan_reset = repo.reset_orphans("server_restart_orphan").await;
+        match &orphan_reset {
+            Ok(reset) if *reset > 0 => tracing::warn!(
+                reset,
+                "startup retired pipeline-run rows left in flight by a previous process"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("startup orphan-run reset failed: {e}"),
         }
+
+        let claim_sweep = if sweep_claims {
+            repo.release_all_pipeline_run_claims("startup_sweep_single_process")
+                .await
+        } else {
+            Ok(0)
+        };
+        match &claim_sweep {
+            Ok(released) if *released > 0 => tracing::warn!(
+                released,
+                "startup released pipeline-run claims left by a previous process"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("startup pipeline-run claim sweep failed: {e}"),
+        }
+
+        orphan_reset?;
+        claim_sweep?;
         Ok(Self::new(repo, cfg))
     }
 

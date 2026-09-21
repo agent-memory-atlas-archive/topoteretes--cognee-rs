@@ -4018,11 +4018,11 @@ pub async fn cognify(
     // window below, or by an explicit `pipeline-unblock --clear`.
     //
     // The one exception is a deployment that asserts a single process per
-    // database (`Settings::resolved_single_process`, derived from a SQLite
-    // relational URL): there every claim alive at startup was written by a
-    // dead incarnation of the starting process, so
-    // `release_all_pipeline_run_claims` sweeps them and the day-long wedge
-    // after a kill does not happen.
+    // database (`Settings::resolved_single_process` — in-memory SQLite, or an
+    // explicit `COGNEE_SINGLE_PROCESS=1`): there every claim alive at startup
+    // was written by a dead incarnation of the starting process, so
+    // `release_all_pipeline_run_claims` sweeps them, alongside the orphaned
+    // `pipeline_runs` row the gate above would otherwise keep refusing on.
     let claim_repo = Arc::clone(&pipeline_run_repo);
     let claim_id = Uuid::new_v4();
     if !claim_repo

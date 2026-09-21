@@ -273,10 +273,15 @@ pub trait PipelineRunRepository: Send + Sync {
     ///
     /// In a multi-process or multi-replica deployment the same call would drop
     /// a *live* peer's claim and re-admit a concurrent run into it — precisely
-    /// the failure the claim exists to prevent. Callers MUST gate it on a
-    /// deployment that asserts one process per database (see
-    /// `Settings::resolved_single_process` / `COGNEE_SINGLE_PROCESS`), and MUST
-    /// call it only before any run of their own has taken a claim.
+    /// the failure the claim exists to prevent. Callers MUST gate it on
+    /// [`crate::single_process::resolve_single_process`] (or
+    /// `Settings::resolved_single_process`, which wraps it), and MUST call it
+    /// only before any run of their own has taken a claim.
+    ///
+    /// Note what that predicate does **not** grant: a SQLite *file* is shared
+    /// by every process opened against it, so only in-memory SQLite qualifies
+    /// on its own and everything else needs an explicit
+    /// `COGNEE_SINGLE_PROCESS=1`.
     ///
     /// # Why it is needed
     ///
@@ -285,13 +290,16 @@ pub trait PipelineRunRepository: Send + Sync {
     /// process killed mid-run — SIGKILL, OOM, an Android process kill — cannot
     /// release. Liveness is then inferred purely from the age of `claimed_at`,
     /// against a deliberately generous staleness window (a day), so the pair
-    /// refuses every new run until that window expires. The *status-row* gate
-    /// has a reset path reachable from every embedding
-    /// (`reset_dataset_pipeline_run_status`); the claim has none outside the
-    /// CLI's `pipeline-unblock --clear`, so an embedded consumer with no HTTP
-    /// server and no CLI is wedged for the whole window. Sweeping at startup,
-    /// where single-process is asserted, closes that gap without weakening the
-    /// claim anywhere else.
+    /// refuses every new run until that window expires.
+    ///
+    /// # Pair it with [`Self::reset_orphans`]
+    ///
+    /// A killed run leaves *two* blockers and the claim is the second of them.
+    /// `check_pipeline_run_qualification` reads the latest `pipeline_runs` row
+    /// first and rejects one left at `Started`, before any claim is consulted —
+    /// and unlike the claim that row never expires. Clearing only the claim
+    /// therefore changes nothing the caller can observe. `cognee-cli
+    /// pipeline-unblock` clears both for this reason; a startup sweep must too.
     ///
     /// `reason` is recorded on the log line emitted per released pair, so the
     /// audit trail says what was dropped and why.

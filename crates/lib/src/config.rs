@@ -429,19 +429,26 @@ pub struct Settings {
 
     /// Does exactly one process use the relational database?
     ///
-    /// `None` (the default) means "derive it from the relational DB URL":
-    /// SQLite is single-process, anything else is not. Set it explicitly —
-    /// here or via `COGNEE_SINGLE_PROCESS` — to override that in either
-    /// direction; [`Settings::resolved_single_process`] is what reads it.
+    /// `None` (the default) means "derive it from the relational DB URL", and
+    /// only an *in-memory* SQLite database derives `true` — see
+    /// [`cognee_database::single_process_default`]. File-backed SQLite derives
+    /// `false`, the shipped `sqlite:./cognee.db?mode=rwc` included: it is a
+    /// file every cognee process in that directory opens, not a private
+    /// handle. Set this explicitly — here or via `COGNEE_SINGLE_PROCESS` — to
+    /// override in either direction; [`Settings::resolved_single_process`] is
+    /// what reads it.
     ///
-    /// Asserting this enables recovery steps that are only sound when no peer
-    /// process exists, above all the startup sweep of `pipeline_run_claims`:
-    /// a claim is released only by its holder, so a run killed mid-flight
-    /// (SIGKILL, OOM, an Android process kill) leaves one behind that refuses
-    /// every later run on that dataset until it ages out a day later. With one
-    /// process per database, every claim present at startup belongs to a dead
-    /// predecessor and can be dropped; with more than one it may belong to a
-    /// live peer and must not be.
+    /// Asserting it enables startup recovery that is only sound when no peer
+    /// process exists: clearing the orphaned `pipeline_runs` row *and* the
+    /// exclusive-run claim that a run killed mid-flight (SIGKILL, OOM, an
+    /// Android process kill) leaves behind. Both refuse every later run on
+    /// that dataset — the claim for a day, the row forever — and neither can
+    /// be cleared by its dead holder. With one process per database every such
+    /// leftover belongs to a dead predecessor; with more than one it may
+    /// belong to a live peer and must not be touched.
+    ///
+    /// An embedded consumer that owns its SQLite file — one process per
+    /// device, say — has to say so: the SDK cannot tell that from the URL.
     pub single_process: Option<bool>,
 }
 
@@ -884,11 +891,17 @@ impl Settings {
         if let Some(v) = str_var("ENABLE_LAST_ACCESSED") {
             self.enable_last_accessed = cognee_utils::parse_env_bool(&v);
         }
-        // Any non-empty value is an explicit answer, so `COGNEE_SINGLE_PROCESS=0`
-        // turns the assertion *off* on a SQLite deployment rather than falling
-        // back to deriving it. `str_var` already discards the empty string.
-        if let Some(v) = str_var(cognee_utils::env::SINGLE_PROCESS_ENV) {
-            self.single_process = Some(cognee_utils::parse_env_bool(&v));
+        // Routed through `parse_single_process_override` rather than parsed
+        // here, so this path and `cognee_database::single_process_from_env`
+        // (which the HTTP server uses) cannot drift. They did: `str_var` keeps
+        // a whitespace-only value, which a bare `parse_env_bool` reads as an
+        // explicit `false` while the other path read it as "derive" — opposite
+        // answers about whether a database may be swept.
+        if let Some(v) = std::env::var(cognee_database::SINGLE_PROCESS_ENV)
+            .ok()
+            .and_then(|raw| cognee_database::parse_single_process_override(&raw))
+        {
+            self.single_process = Some(v);
         }
     }
 
@@ -896,13 +909,16 @@ impl Settings {
     ///
     /// The explicit [`Settings::single_process`] answer when the operator gave
     /// one, otherwise derived from [`Settings::resolved_relational_db_url`]:
-    /// SQLite is single-process, anything else is not.
+    /// only an *in-memory* SQLite database, which no other process can open,
+    /// derives `true`. File-backed SQLite — including the shipped default
+    /// `sqlite:./cognee.db?mode=rwc` — is shared by every process started
+    /// against it, so it must be asserted explicitly.
     ///
     /// Callers use this to gate recovery that is only sound with no peer
     /// process — see
-    /// `cognee_database::PipelineRunRepository::release_all_pipeline_run_claims`.
+    /// [`cognee_database::PipelineRunRepository::release_all_pipeline_run_claims`].
     pub fn resolved_single_process(&self) -> bool {
-        cognee_utils::env::resolve_single_process(
+        cognee_database::resolve_single_process(
             &self.resolved_relational_db_url(),
             self.single_process,
         )

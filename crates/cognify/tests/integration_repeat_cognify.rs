@@ -174,21 +174,33 @@ impl Harness {
     }
 
     /// The startup recovery step, in the shape both callers use it: resolve
-    /// the single-process assertion from the relational URL, and sweep the
-    /// claims only if it holds.
+    /// the single-process assertion from the relational URL, and — only if it
+    /// holds — clear *both* of the gates a killed run leaves set.
+    ///
+    /// Returns `(rows reset, claims released)`. Both must be cleared to
+    /// unwedge a dataset: `check_pipeline_run_qualification` reads the
+    /// `pipeline_runs` row before any claim is consulted, so a sweep that
+    /// dropped only the claim would leave the run refused exactly as before.
     ///
     /// `configured` stands in for an explicit `COGNEE_SINGLE_PROCESS` /
     /// `Settings::single_process`; `None` derives it. Passed in rather than
     /// read from the environment so two tests asserting opposite outcomes
     /// cannot race each other through a process-global.
-    async fn startup_sweep(&self, relational_db_url: &str, configured: Option<bool>) -> u64 {
-        if !cognee_utils::env::resolve_single_process(relational_db_url, configured) {
-            return 0;
+    async fn startup_sweep(&self, relational_db_url: &str, configured: Option<bool>) -> (u64, u64) {
+        if !cognee_database::resolve_single_process(relational_db_url, configured) {
+            return (0, 0);
         }
-        self.pipeline_run_repo
+        let reset = self
+            .pipeline_run_repo
+            .reset_orphans("test_startup_orphan_reset")
+            .await
+            .expect("reset_orphans");
+        let released = self
+            .pipeline_run_repo
             .release_all_pipeline_run_claims("test_startup_sweep")
             .await
-            .expect("release_all_pipeline_run_claims")
+            .expect("release_all_pipeline_run_claims");
+        (reset, released)
     }
 
     async fn add(&self, dataset_name: &str, text: &str) -> Vec<Data> {
@@ -510,15 +522,19 @@ async fn a_finished_run_releases_its_claim() {
     );
 }
 
-/// The killed-run recovery: a claim its holder never released blocks every
-/// later run for a day, and the startup sweep is what frees it.
+/// A run killed mid-flight, modelled as the two blockers it really leaves
+/// behind — a `Started` row **and** a claim — and cleared by the startup sweep.
 ///
-/// The harness is a SQLite deployment, so the single-process assertion is
-/// derived as true and the sweep runs — the case that matters for an embedded
-/// consumer (the Android app, the Python/C/TS bindings), which has neither an
-/// HTTP server nor a CLI to unblock with.
+/// Seeding only the claim would make this test pass against a sweep that
+/// clears only the claim, which is worthless: the `Started` row is read
+/// *first* by `check_pipeline_run_qualification` and returns `AlreadyRunning`
+/// before the claim is ever consulted. That row also never ages out, where the
+/// claim at least does after a day — so the half-fix would leave the dataset
+/// permanently wedged for exactly the embedded consumer (the Android app, the
+/// Python/C/TS bindings) this exists for, which has neither an HTTP server nor
+/// a CLI to unblock with.
 #[tokio::test]
-async fn a_claim_left_by_a_killed_run_is_cleared_when_single_process_is_asserted() {
+async fn a_killed_run_is_fully_cleared_when_single_process_is_asserted() {
     let h = Harness::new().await;
     let dataset_name = "repeat_cognify_swept";
     let config = base_config();
@@ -526,9 +542,11 @@ async fn a_claim_left_by_a_killed_run_is_cleared_when_single_process_is_asserted
     let items = h.add(dataset_name, WAVE_1_TEXT).await;
     let dataset_id = h.dataset_id(dataset_name).await;
 
-    // A run killed mid-flight: the claim outlives the process that took it,
-    // and nothing will ever release it — `release_pipeline_run_claim` filters
-    // on this `claim_id`, which died with its holder.
+    // Gate 1: the row the killed run wrote when it started.
+    h.seed_started_row(dataset_id).await;
+    // Gate 2: its claim, which outlives the process that took it — nothing
+    // will ever release it, because `release_pipeline_run_claim` filters on
+    // this `claim_id`, and it died with its holder.
     let dead_holder = Uuid::new_v4();
     assert!(
         h.pipeline_run_repo
@@ -537,24 +555,40 @@ async fn a_claim_left_by_a_killed_run_is_cleared_when_single_process_is_asserted
             .expect("claim from the killed run"),
         "the killed run's claim must be granted first"
     );
+
     assert!(
         matches!(
             h.try_cognify(dataset_id, items.clone(), &config)
                 .await
-                .expect_err("the leftover claim must block the run"),
+                .expect_err("the leftovers must block the run"),
             CognifyError::PipelineAlreadyRunning { .. }
         ),
-        "without a sweep the dataset stays wedged until the claim ages out"
+        "without a sweep the dataset stays wedged"
     );
 
-    // Restart. `None` = derive the assertion, and the harness's URL is SQLite.
+    // Restart, with single-process asserted the way an embedder must now
+    // assert it: the harness runs on a SQLite *file*, which derives `false`
+    // precisely because sibling processes can open it.
     let db_url = h.db_url.clone();
     assert_eq!(
         h.startup_sweep(&db_url, None).await,
-        1,
-        "the sweep must report the claim it dropped, so the log names it"
+        (0, 0),
+        "a file-backed SQLite URL must not sweep on its own — a sibling process \
+         can hold these very rows"
+    );
+    assert_eq!(
+        h.startup_sweep(&db_url, Some(true)).await,
+        (1, 1),
+        "the sweep must report both the row it retired and the claim it dropped"
     );
 
+    // Both gates gone, so the dataset runs again — and the assertion that
+    // catches a claim-only sweep is this one, not the counts above.
+    assert_eq!(
+        h.latest_cognify_status(dataset_id).await,
+        Some(PipelineRunStatus::Errored),
+        "the orphaned Started row must have been retired, not left in flight"
+    );
     let result = h.cognify(dataset_id, items, &config).await;
     assert!(
         !result.already_completed && !result.entities.is_empty(),
@@ -566,11 +600,12 @@ async fn a_claim_left_by_a_killed_run_is_cleared_when_single_process_is_asserted
 /// run at all.
 ///
 /// A claim in a multi-process or multi-replica deployment may belong to a live
-/// peer, and dropping it would re-admit exactly the concurrent run the claim
-/// exists to prevent. So the same leftover claim survives and keeps refusing —
-/// the pre-fix behaviour, preserved deliberately.
+/// peer, and dropping it — or retiring the `Started` row that peer's run is
+/// still writing against — would re-admit exactly the concurrent run the claim
+/// exists to prevent. So both leftovers survive and keep refusing: the pre-fix
+/// behaviour, preserved deliberately.
 #[tokio::test]
-async fn a_claim_survives_the_sweep_when_single_process_is_not_asserted() {
+async fn a_killed_runs_leftovers_survive_when_single_process_is_not_asserted() {
     let h = Harness::new().await;
     let dataset_name = "repeat_cognify_not_swept";
     let config = base_config();
@@ -578,6 +613,7 @@ async fn a_claim_survives_the_sweep_when_single_process_is_not_asserted() {
     let items = h.add(dataset_name, WAVE_1_TEXT).await;
     let dataset_id = h.dataset_id(dataset_name).await;
 
+    h.seed_started_row(dataset_id).await;
     let peer_holder = Uuid::new_v4();
     assert!(
         h.pipeline_run_repo
@@ -587,14 +623,19 @@ async fn a_claim_survives_the_sweep_when_single_process_is_not_asserted() {
         "the peer's claim must be granted first"
     );
 
-    // A shared relational database: the derivation says "not single-process",
-    // so startup must leave every claim alone.
-    assert_eq!(
-        h.startup_sweep("postgres://user:pw@shared-host:5432/cognee", None)
-            .await,
-        0,
-        "a shared-database deployment must not sweep claims at startup"
-    );
+    // Two shared deployments that must both be left alone: a Postgres every
+    // replica connects to, and the shipped default relational URL — a SQLite
+    // *file*, which every cognee process started in that directory opens.
+    for shared in [
+        "postgres://user:pw@shared-host:5432/cognee",
+        "sqlite:./cognee.db?mode=rwc",
+    ] {
+        assert_eq!(
+            h.startup_sweep(shared, None).await,
+            (0, 0),
+            "{shared} is reachable by sibling processes and must not be swept"
+        );
+    }
 
     let held = h
         .pipeline_run_repo
@@ -606,22 +647,27 @@ async fn a_claim_survives_the_sweep_when_single_process_is_not_asserted() {
         held.claim_id, peer_holder,
         "the surviving claim must still be the peer's, not a rewritten one"
     );
+    assert_eq!(
+        h.latest_cognify_status(dataset_id).await,
+        Some(PipelineRunStatus::Started),
+        "the peer's in-flight row must not be retired underneath it"
+    );
     assert!(
         matches!(
             h.try_cognify(dataset_id, items, &config)
                 .await
-                .expect_err("the peer's claim must still block the run"),
+                .expect_err("the peer's run must still block this one"),
             CognifyError::PipelineAlreadyRunning { .. }
         ),
         "cross-process exclusion must be unaffected by the single-process sweep"
     );
 
-    // And the explicit override is what a single-process Postgres deployment
-    // uses to opt in — same database, opposite answer.
+    // And the explicit override is how a deployment that really does own its
+    // database opts in — same URL, opposite answer.
     assert_eq!(
         h.startup_sweep("postgres://user:pw@shared-host:5432/cognee", Some(true))
             .await,
-        1,
+        (1, 1),
         "an operator asserting single-process must get the sweep on any backend"
     );
 }

@@ -81,12 +81,40 @@ impl DefaultPipelineRunRegistry {
     /// Create a new registry and reset orphan rows on startup.
     ///
     /// Calls `repo.reset_orphans("server_restart_orphan")` once before
-    /// returning, per §12 of the spec (crash & restart recovery).
+    /// returning, per §12 of the spec (crash & restart recovery). That covers
+    /// the *status-row* gate: a row left at `Initiated`/`Started` by a killed
+    /// process, which `check_pipeline_run_qualification` would otherwise read
+    /// as a run still in flight.
+    ///
+    /// `sweep_claims` additionally drops every row in `pipeline_run_claims`,
+    /// which is the *second* gate and the one with no other recovery path from
+    /// an embedded consumer. Pass `true` **only** where the deployment asserts
+    /// one process per relational database (see `Settings::resolved_single_process`
+    /// / `COGNEE_SINGLE_PROCESS`): only then is every claim present at startup
+    /// known to belong to a dead predecessor rather than a live peer, whose
+    /// claim this would silently drop — re-admitting the concurrent run the
+    /// claim exists to prevent. With `false` the claim behaves exactly as
+    /// before: released by its holder, or reclaimed once it ages out.
+    ///
+    /// Both steps run before the registry exists, so no run of this process
+    /// can have taken a claim yet.
     pub async fn new_with_orphan_reset(
         repo: Arc<dyn PipelineRunRepository>,
         cfg: RegistryConfig,
+        sweep_claims: bool,
     ) -> Result<Arc<Self>, RegistryError> {
         repo.reset_orphans("server_restart_orphan").await?;
+        if sweep_claims {
+            let released = repo
+                .release_all_pipeline_run_claims("startup_sweep_single_process")
+                .await?;
+            if released > 0 {
+                tracing::warn!(
+                    released,
+                    "startup released pipeline-run claims left by a previous process"
+                );
+            }
+        }
         Ok(Self::new(repo, cfg))
     }
 

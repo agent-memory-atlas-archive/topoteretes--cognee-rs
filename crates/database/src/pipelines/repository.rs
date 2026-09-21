@@ -244,8 +244,11 @@ pub trait PipelineRunRepository: Send + Sync {
     ///
     /// Named `try_` rather than `force_` on purpose: it removes nothing unless
     /// `claim_id` still holds the pair, so a caller that does not have the
-    /// holder's id cannot use it to clear a claim. There is deliberately no
-    /// holder-unscoped variant — see the TOCTOU the scoping prevents.
+    /// holder's id cannot use it to clear a claim. The only holder-unscoped
+    /// variant is [`Self::release_all_pipeline_run_claims`], which is sound
+    /// solely at startup in a single-process deployment — see the TOCTOU the
+    /// scoping here prevents, which that one avoids by there being no peer
+    /// whose claim it could stomp.
     ///
     /// The default implementation reports nothing released.
     async fn try_release_pipeline_run_claim(
@@ -255,6 +258,48 @@ pub trait PipelineRunRepository: Send + Sync {
         _claim_id: Uuid,
     ) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    /// Drop **every** exclusive-run claim, returning how many went.
+    ///
+    /// # Only sound where one process per database is asserted
+    ///
+    /// Unlike every other release above, this is unscoped: it does not know
+    /// whose claims it is dropping. That is safe in exactly one situation — a
+    /// process starting up that is the *only* process using this database.
+    /// Every claim it finds was then written by a previous incarnation of
+    /// itself, and every one of those holders is dead by definition, because
+    /// the process that would have held them is the one now starting.
+    ///
+    /// In a multi-process or multi-replica deployment the same call would drop
+    /// a *live* peer's claim and re-admit a concurrent run into it — precisely
+    /// the failure the claim exists to prevent. Callers MUST gate it on a
+    /// deployment that asserts one process per database (see
+    /// `Settings::resolved_single_process` / `COGNEE_SINGLE_PROCESS`), and MUST
+    /// call it only before any run of their own has taken a claim.
+    ///
+    /// # Why it is needed
+    ///
+    /// A claim is released only by its holder
+    /// ([`Self::release_pipeline_run_claim`] filters on `claim_id`), so a
+    /// process killed mid-run — SIGKILL, OOM, an Android process kill — cannot
+    /// release. Liveness is then inferred purely from the age of `claimed_at`,
+    /// against a deliberately generous staleness window (a day), so the pair
+    /// refuses every new run until that window expires. The *status-row* gate
+    /// has a reset path reachable from every embedding
+    /// (`reset_dataset_pipeline_run_status`); the claim has none outside the
+    /// CLI's `pipeline-unblock --clear`, so an embedded consumer with no HTTP
+    /// server and no CLI is wedged for the whole window. Sweeping at startup,
+    /// where single-process is asserted, closes that gap without weakening the
+    /// claim anywhere else.
+    ///
+    /// `reason` is recorded on the log line emitted per released pair, so the
+    /// audit trail says what was dropped and why.
+    ///
+    /// The default implementation releases nothing, matching the default
+    /// [`Self::try_claim_pipeline_run`], which never records a claim.
+    async fn release_all_pipeline_run_claims(&self, _reason: &str) -> Result<u64, DbError> {
+        Ok(0)
     }
 
     /// Retire the orphaned `Initiated`/`Started` row whose primary key is

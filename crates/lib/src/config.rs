@@ -426,6 +426,23 @@ pub struct Settings {
 
     // -- Feature flags -----------------------------------------------------------
     pub enable_last_accessed: bool,
+
+    /// Does exactly one process use the relational database?
+    ///
+    /// `None` (the default) means "derive it from the relational DB URL":
+    /// SQLite is single-process, anything else is not. Set it explicitly —
+    /// here or via `COGNEE_SINGLE_PROCESS` — to override that in either
+    /// direction; [`Settings::resolved_single_process`] is what reads it.
+    ///
+    /// Asserting this enables recovery steps that are only sound when no peer
+    /// process exists, above all the startup sweep of `pipeline_run_claims`:
+    /// a claim is released only by its holder, so a run killed mid-flight
+    /// (SIGKILL, OOM, an Android process kill) leaves one behind that refuses
+    /// every later run on that dataset until it ages out a day later. With one
+    /// process per database, every claim present at startup belongs to a dead
+    /// predecessor and can be dropped; with more than one it may belong to a
+    /// live peer and must not be.
+    pub single_process: Option<bool>,
 }
 
 impl Settings {
@@ -867,6 +884,28 @@ impl Settings {
         if let Some(v) = str_var("ENABLE_LAST_ACCESSED") {
             self.enable_last_accessed = cognee_utils::parse_env_bool(&v);
         }
+        // Any non-empty value is an explicit answer, so `COGNEE_SINGLE_PROCESS=0`
+        // turns the assertion *off* on a SQLite deployment rather than falling
+        // back to deriving it. `str_var` already discards the empty string.
+        if let Some(v) = str_var(cognee_utils::env::SINGLE_PROCESS_ENV) {
+            self.single_process = Some(cognee_utils::parse_env_bool(&v));
+        }
+    }
+
+    /// Whether exactly one process uses the relational database.
+    ///
+    /// The explicit [`Settings::single_process`] answer when the operator gave
+    /// one, otherwise derived from [`Settings::resolved_relational_db_url`]:
+    /// SQLite is single-process, anything else is not.
+    ///
+    /// Callers use this to gate recovery that is only sound with no peer
+    /// process — see
+    /// `cognee_database::PipelineRunRepository::release_all_pipeline_run_claims`.
+    pub fn resolved_single_process(&self) -> bool {
+        cognee_utils::env::resolve_single_process(
+            &self.resolved_relational_db_url(),
+            self.single_process,
+        )
     }
 
     /// Returns the effective relational DB connection URL.
@@ -1480,6 +1519,7 @@ impl Default for Settings {
 
             // Feature flags
             enable_last_accessed: false,
+            single_process: None,
         }
     }
 }

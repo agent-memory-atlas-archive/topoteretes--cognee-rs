@@ -66,6 +66,78 @@ pub struct CogneeServices {
     pub checkpoint_store: Arc<dyn CheckpointStore>,
 }
 
+/// Has this *process* already swept the exclusive-run claims?
+///
+/// Deliberately a process-global, not per handle and not per config version.
+/// `CogneeServices::build` runs again whenever the config version changes, and
+/// by then a cognify started through an earlier handle may be holding a claim
+/// that is very much alive. Sweeping then would drop it and let a second run
+/// into the same dataset — the exact failure the claim prevents. The only
+/// moment at which every claim in the database is provably dead is the first
+/// build in a fresh process, so the sweep happens there and nowhere else.
+static CLAIMS_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Release claims left behind by a killed predecessor — once per process, and
+/// only where the deployment asserts one process per relational database.
+///
+/// A run killed mid-flight (SIGKILL, OOM, an Android process kill) cannot
+/// release its claim: `release_pipeline_run_claim` filters on the holder's
+/// `claim_id`, which died with it. Liveness is then inferred from the age of
+/// the claim against a day-long staleness window, so the dataset refuses every
+/// new cognify/memify until that window expires. The status-row gate has a
+/// reset an embedder can call (`reset_dataset_pipeline_run_status`); the claim
+/// has none outside the CLI, which an embedded consumer does not have. This
+/// closes that gap.
+///
+/// Safety: an unscoped release is sound **only** where no peer process can
+/// hold a claim. With one process per database, every claim present at the
+/// first build of a fresh process was written by a dead incarnation of that
+/// same process. A multi-process or multi-replica deployment derives `false`
+/// (non-SQLite relational URL) and is left entirely alone — its claims keep
+/// excluding concurrent runs. `COGNEE_SINGLE_PROCESS` overrides the derivation
+/// in either direction.
+///
+/// Best-effort: a failure here is logged and ignored. The sweep is a recovery
+/// convenience, and refusing to build the SDK because it did not work would
+/// turn a recoverable wedge into a hard startup failure.
+async fn sweep_stale_pipeline_run_claims(
+    cm: &ComponentManager,
+    pipeline_run_repo: &Arc<dyn PipelineRunRepository>,
+) {
+    // Snapshot under the read guard and drop it before the `.await`:
+    // `RwLockReadGuard` is `!Send`, and this future is awaited from PyO3
+    // bindings that require `Send`.
+    let single_process = {
+        let settings = cm.settings();
+        settings.resolved_single_process()
+    };
+    if !single_process {
+        return;
+    }
+
+    // `swap` rather than load-then-store, so two concurrent first builds
+    // cannot both decide they are the sweeper.
+    if CLAIMS_SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    match pipeline_run_repo
+        .release_all_pipeline_run_claims("sdk_startup_sweep_single_process")
+        .await
+    {
+        Ok(0) => {}
+        Ok(released) => tracing::warn!(
+            released,
+            "released pipeline-run claims left behind by a previous process; the datasets \
+             they held are runnable again"
+        ),
+        Err(e) => tracing::warn!(
+            "startup sweep of pipeline-run claims failed (non-fatal); a dataset wedged by a \
+             killed run stays wedged until its claim ages out: {e}"
+        ),
+    }
+}
+
 impl CogneeServices {
     /// Build the full bundle from a `ComponentManager`, returning the bundle and
     /// the resolved owner id.
@@ -113,6 +185,8 @@ impl CogneeServices {
 
         let pipeline_run_repo: Arc<dyn PipelineRunRepository> =
             Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&database)));
+
+        sweep_stale_pipeline_run_claims(cm, &pipeline_run_repo).await;
 
         let add_pipeline = Arc::new(
             AddPipeline::new(

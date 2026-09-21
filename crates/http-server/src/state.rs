@@ -160,7 +160,10 @@ impl AppState {
     /// registry.  Used by the server startup path when backend env vars are
     /// present.
     ///
-    /// Runs the orphan-reset once on startup per pipelines.md §12.
+    /// Runs the orphan-reset once on startup per pipelines.md §12, and — only
+    /// where the deployment asserts one process per relational database —
+    /// also sweeps the exclusive-run claims that a killed predecessor could
+    /// not release.
     pub async fn build_with_db(
         config: HttpServerConfig,
         db: Arc<DatabaseConnection>,
@@ -169,9 +172,24 @@ impl AppState {
             as Arc<dyn PipelineRunRepository>;
         let registry_cfg = config.to_registry_config();
 
+        // Clearing claims is sound only with no peer process: a claim is
+        // released by its holder alone, so at startup in a single-process
+        // deployment every surviving claim belongs to a dead predecessor.
+        // A multi-replica server shares a Postgres, derives `false` here, and
+        // is untouched — its claims keep excluding concurrent runs across
+        // replicas exactly as before. `COGNEE_SINGLE_PROCESS` overrides the
+        // derivation in either direction.
+        let sweep_claims = cognee_utils::env::single_process_from_env(&config.relational_db_url);
+
         // Run orphan reset on startup (best-effort — non-fatal).
         let pipelines: Arc<dyn PipelineRunRegistry> =
-            match DefaultPipelineRunRegistry::new_with_orphan_reset(repo, registry_cfg).await {
+            match DefaultPipelineRunRegistry::new_with_orphan_reset(
+                repo,
+                registry_cfg,
+                sweep_claims,
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(

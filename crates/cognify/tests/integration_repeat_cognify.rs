@@ -117,6 +117,11 @@ struct Harness {
     pipeline_run_repo: Arc<dyn PipelineRunRepository>,
     ingest: AddPipeline,
     owner_id: Uuid,
+    /// The relational URL this harness connected to. A real one, because the
+    /// single-process assertion the startup sweep is gated on is derived from
+    /// it — hardcoding a string in the test would assert nothing about the
+    /// deployment the harness actually is.
+    db_url: String,
 }
 
 impl Harness {
@@ -164,7 +169,26 @@ impl Harness {
             pipeline_run_repo,
             ingest,
             owner_id: Uuid::nil(),
+            db_url,
         }
+    }
+
+    /// The startup recovery step, in the shape both callers use it: resolve
+    /// the single-process assertion from the relational URL, and sweep the
+    /// claims only if it holds.
+    ///
+    /// `configured` stands in for an explicit `COGNEE_SINGLE_PROCESS` /
+    /// `Settings::single_process`; `None` derives it. Passed in rather than
+    /// read from the environment so two tests asserting opposite outcomes
+    /// cannot race each other through a process-global.
+    async fn startup_sweep(&self, relational_db_url: &str, configured: Option<bool>) -> u64 {
+        if !cognee_utils::env::resolve_single_process(relational_db_url, configured) {
+            return 0;
+        }
+        self.pipeline_run_repo
+            .release_all_pipeline_run_claims("test_startup_sweep")
+            .await
+            .expect("release_all_pipeline_run_claims")
     }
 
     async fn add(&self, dataset_name: &str, text: &str) -> Vec<Data> {
@@ -483,5 +507,121 @@ async fn a_finished_run_releases_its_claim() {
             .await
             .expect("claim after run"),
         "the claim must be free once the run has finished"
+    );
+}
+
+/// The killed-run recovery: a claim its holder never released blocks every
+/// later run for a day, and the startup sweep is what frees it.
+///
+/// The harness is a SQLite deployment, so the single-process assertion is
+/// derived as true and the sweep runs — the case that matters for an embedded
+/// consumer (the Android app, the Python/C/TS bindings), which has neither an
+/// HTTP server nor a CLI to unblock with.
+#[tokio::test]
+async fn a_claim_left_by_a_killed_run_is_cleared_when_single_process_is_asserted() {
+    let h = Harness::new().await;
+    let dataset_name = "repeat_cognify_swept";
+    let config = base_config();
+
+    let items = h.add(dataset_name, WAVE_1_TEXT).await;
+    let dataset_id = h.dataset_id(dataset_name).await;
+
+    // A run killed mid-flight: the claim outlives the process that took it,
+    // and nothing will ever release it — `release_pipeline_run_claim` filters
+    // on this `claim_id`, which died with its holder.
+    let dead_holder = Uuid::new_v4();
+    assert!(
+        h.pipeline_run_repo
+            .try_claim_pipeline_run(dataset_id, COGNIFY_PIPELINE, dead_holder, CLAIM_STALE_AFTER)
+            .await
+            .expect("claim from the killed run"),
+        "the killed run's claim must be granted first"
+    );
+    assert!(
+        matches!(
+            h.try_cognify(dataset_id, items.clone(), &config)
+                .await
+                .expect_err("the leftover claim must block the run"),
+            CognifyError::PipelineAlreadyRunning { .. }
+        ),
+        "without a sweep the dataset stays wedged until the claim ages out"
+    );
+
+    // Restart. `None` = derive the assertion, and the harness's URL is SQLite.
+    let db_url = h.db_url.clone();
+    assert_eq!(
+        h.startup_sweep(&db_url, None).await,
+        1,
+        "the sweep must report the claim it dropped, so the log names it"
+    );
+
+    let result = h.cognify(dataset_id, items, &config).await;
+    assert!(
+        !result.already_completed && !result.entities.is_empty(),
+        "the dataset must be runnable again immediately after the sweep"
+    );
+}
+
+/// The safety half: where single-process is *not* asserted, the sweep must not
+/// run at all.
+///
+/// A claim in a multi-process or multi-replica deployment may belong to a live
+/// peer, and dropping it would re-admit exactly the concurrent run the claim
+/// exists to prevent. So the same leftover claim survives and keeps refusing —
+/// the pre-fix behaviour, preserved deliberately.
+#[tokio::test]
+async fn a_claim_survives_the_sweep_when_single_process_is_not_asserted() {
+    let h = Harness::new().await;
+    let dataset_name = "repeat_cognify_not_swept";
+    let config = base_config();
+
+    let items = h.add(dataset_name, WAVE_1_TEXT).await;
+    let dataset_id = h.dataset_id(dataset_name).await;
+
+    let peer_holder = Uuid::new_v4();
+    assert!(
+        h.pipeline_run_repo
+            .try_claim_pipeline_run(dataset_id, COGNIFY_PIPELINE, peer_holder, CLAIM_STALE_AFTER)
+            .await
+            .expect("peer claim"),
+        "the peer's claim must be granted first"
+    );
+
+    // A shared relational database: the derivation says "not single-process",
+    // so startup must leave every claim alone.
+    assert_eq!(
+        h.startup_sweep("postgres://user:pw@shared-host:5432/cognee", None)
+            .await,
+        0,
+        "a shared-database deployment must not sweep claims at startup"
+    );
+
+    let held = h
+        .pipeline_run_repo
+        .get_pipeline_run_claim(dataset_id, COGNIFY_PIPELINE)
+        .await
+        .expect("get_pipeline_run_claim")
+        .expect("the peer's claim must survive");
+    assert_eq!(
+        held.claim_id, peer_holder,
+        "the surviving claim must still be the peer's, not a rewritten one"
+    );
+    assert!(
+        matches!(
+            h.try_cognify(dataset_id, items, &config)
+                .await
+                .expect_err("the peer's claim must still block the run"),
+            CognifyError::PipelineAlreadyRunning { .. }
+        ),
+        "cross-process exclusion must be unaffected by the single-process sweep"
+    );
+
+    // And the explicit override is what a single-process Postgres deployment
+    // uses to opt in — same database, opposite answer.
+    assert_eq!(
+        h.startup_sweep("postgres://user:pw@shared-host:5432/cognee", Some(true))
+            .await,
+        1,
+        "an operator asserting single-process must get the sweep on any backend"
     );
 }

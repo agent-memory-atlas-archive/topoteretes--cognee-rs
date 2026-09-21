@@ -1337,6 +1337,88 @@ async fn force_release_does_not_remove_a_claim_taken_over_since_the_read() {
 }
 
 // ---------------------------------------------------------------------------
+// Startup sweep of every claim
+//
+// The holder-scoped releases above are the whole recovery story for a claim,
+// and a killed process has no holder left to do the releasing — so the pair
+// stays wedged until the day-long staleness window expires. The sweep is the
+// escape hatch for a deployment that can prove no peer process exists: at
+// startup, with one process per database, every claim in the table belongs to
+// a dead predecessor. These tests cover the repository half; enforcing the
+// single-process precondition is the caller's job.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn release_all_clears_every_pair_and_reports_count() {
+    let db = make_db().await;
+    let repo = make_repo(Arc::clone(&db));
+
+    // Two datasets, and two pipelines on one of them: the sweep is unscoped in
+    // both dimensions, unlike every other release in this file.
+    let wedged = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    create_dataset(&db, wedged).await;
+    create_dataset(&db, other).await;
+
+    let pairs = [
+        (wedged, "cognify_pipeline"),
+        (wedged, "memify_pipeline"),
+        (other, "cognify_pipeline"),
+    ];
+    for (dataset_id, pipeline_name) in pairs {
+        assert!(
+            repo.try_claim_pipeline_run(dataset_id, pipeline_name, Uuid::new_v4(), NEVER_STALE)
+                .await
+                .expect("claim"),
+            "the {pipeline_name} claim on {dataset_id} must be granted first"
+        );
+    }
+
+    assert_eq!(
+        repo.release_all_pipeline_run_claims("test_startup_sweep")
+            .await
+            .expect("release_all_pipeline_run_claims"),
+        3,
+        "the count is what a caller logs, so it must be the number actually removed"
+    );
+
+    for (dataset_id, pipeline_name) in pairs {
+        assert!(
+            repo.get_pipeline_run_claim(dataset_id, pipeline_name)
+                .await
+                .expect("get_pipeline_run_claim")
+                .is_none(),
+            "{pipeline_name} on {dataset_id} must be free after the sweep"
+        );
+        // The point of the sweep: the pair is runnable again without waiting
+        // out the staleness window and without the dead holder's `claim_id`.
+        assert!(
+            repo.try_claim_pipeline_run(dataset_id, pipeline_name, Uuid::new_v4(), NEVER_STALE)
+                .await
+                .expect("re-claim after sweep"),
+            "{pipeline_name} on {dataset_id} must be claimable again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn release_all_on_empty_table_is_zero() {
+    let db = make_db().await;
+    let repo = make_repo(Arc::clone(&db));
+
+    // The overwhelmingly common startup: nothing was left behind. It must be
+    // silent — zero, not an error — because callers warn on a non-zero count,
+    // and a warning on every clean start would train operators to ignore the
+    // one that matters.
+    assert_eq!(
+        repo.release_all_pipeline_run_claims("test_startup_sweep")
+            .await
+            .expect("release_all on an empty table must not error"),
+        0
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Scoped orphan reset (SDK-616)
 //
 // The claim is the *second* gate. `check_pipeline_run_qualification` reads the

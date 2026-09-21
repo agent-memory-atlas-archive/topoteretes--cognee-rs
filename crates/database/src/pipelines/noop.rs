@@ -79,6 +79,14 @@ impl PipelineRunRepository for NoopPipelineRunRepository {
         Ok(Vec::new())
     }
 
+    /// Nothing to release: this repository never records a claim, so it never
+    /// refuses a run either. Spelled out rather than inherited from the trait
+    /// default so "no persistence, no exclusion, nothing to recover" is
+    /// visible at the implementation.
+    async fn release_all_pipeline_run_claims(&self, _reason: &str) -> Result<u64, DatabaseError> {
+        Ok(0)
+    }
+
     async fn reset_orphans(&self, _reason: &str) -> Result<u64, DatabaseError> {
         Ok(0)
     }

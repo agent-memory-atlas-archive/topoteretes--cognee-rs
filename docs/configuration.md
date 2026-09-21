@@ -500,6 +500,29 @@ config (see [roadmap/cognify-compatibility-plan.md](roadmap/cognify-compatibilit
 | `DB_HOST` / `DB_PORT` | `db_host` / `db_port` | `localhost` / `5432` |
 | `DB_NAME` | `db_name` | `cognee_db` |
 | `DB_USERNAME` / `DB_PASSWORD` | … | _(empty)_ |
+| `COGNEE_SINGLE_PROCESS` | `single_process` | _(derived)_ |
+
+### `COGNEE_SINGLE_PROCESS` — does one process own this database?
+
+Unset (the default) means "derive it": a SQLite relational URL is taken as
+single-process, anything else — Postgres above all — is not. Any non-empty
+value is an explicit answer (truthy per `true` / `1` / `yes` / `on`, anything
+else `false`), so the derivation can be overridden in either direction.
+`Settings::resolved_single_process()` is what reads it.
+
+Asserting it enables recovery that is only sound with no peer process, above
+all the startup sweep of `pipeline_run_claims`. A cognify/memify holds an
+exclusive-run claim on its `(dataset, pipeline)` pair, and only the holder can
+release it — so a run killed mid-flight (SIGKILL, OOM, an Android process
+kill) leaves a claim behind that refuses every later run on that dataset until
+it ages out 24 h later. With one process per database, every claim present at
+startup belongs to a dead predecessor and is cleared; with more than one it
+may belong to a live peer, so nothing is cleared and the claim keeps excluding
+concurrent runs across processes exactly as before.
+
+Turn it **off** on a SQLite file two cognee processes really do share
+(unsupported, but reachable). Turn it **on** for a single-process deployment
+that happens to use Postgres and wants the same crash recovery.
 
 ## Chunking & tokenizer
 

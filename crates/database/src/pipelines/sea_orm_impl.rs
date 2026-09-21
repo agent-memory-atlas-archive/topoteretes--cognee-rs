@@ -632,6 +632,53 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
         Ok(deleted.rows_affected > 0)
     }
 
+    /// Read the claims first, then delete them all, so every dropped pair can
+    /// be named in the log. The read/delete pair is not atomic and does not
+    /// need to be: the caller has asserted it is the only process on this
+    /// database and has not started a run yet, so nothing can be writing
+    /// claims concurrently. The delete's own `rows_affected` — not the length
+    /// of the read — is what is returned, so a row that vanished between the
+    /// two is not counted as released.
+    async fn release_all_pipeline_run_claims(&self, reason: &str) -> Result<u64, DatabaseError> {
+        let rows = pipeline_run_claim::Entity::find()
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                DatabaseError::QueryError(format!("list pipeline_run_claims failed: {e}"))
+            })?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now();
+        for row in &rows {
+            // One line per pair, at `warn`: a claim being dropped without its
+            // holder's consent is exactly the kind of thing an operator needs
+            // to find in the log after an unexplained concurrent run. The age
+            // is what tells them whether this was a crash leftover (hours or
+            // days) or something that should not have been swept at all.
+            tracing::warn!(
+                dataset_id = %row.dataset_id,
+                pipeline_name = %row.pipeline_name,
+                claim_id = %row.claim_id,
+                age_seconds = now.signed_duration_since(row.claimed_at).num_seconds(),
+                reason = %reason,
+                "releasing a pipeline-run claim left behind by a previous process; this is \
+                 only sound because the deployment asserts a single process per database"
+            );
+        }
+
+        let deleted = pipeline_run_claim::Entity::delete_many()
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                DatabaseError::QueryError(format!("release all pipeline_run_claims failed: {e}"))
+            })?;
+
+        Ok(deleted.rows_affected)
+    }
+
     async fn reset_orphan_run(
         &self,
         dataset_id: Uuid,

@@ -4011,10 +4011,18 @@ pub async fn cognify(
     // concurrent runs across processes, which Python's in-process
     // `asyncio.Lock` (`infrastructure/locks/dataset_lock.py`) does not.
     //
-    // Deliberately NOT cleared by the server's startup orphan sweep: claims
-    // are cross-process, so one instance restarting must not drop another
-    // live instance's claim. A claim a killed process left behind is recovered
-    // by the staleness window below, or by an explicit reset.
+    // Deliberately NOT cleared by the startup orphan sweep wherever more than
+    // one process can share the database: claims are cross-process, so one
+    // instance restarting must not drop another live instance's claim. There
+    // a claim a killed process left behind is recovered by the staleness
+    // window below, or by an explicit `pipeline-unblock --clear`.
+    //
+    // The one exception is a deployment that asserts a single process per
+    // database (`Settings::resolved_single_process`, derived from a SQLite
+    // relational URL): there every claim alive at startup was written by a
+    // dead incarnation of the starting process, so
+    // `release_all_pipeline_run_claims` sweeps them and the day-long wedge
+    // after a kill does not happen.
     let claim_repo = Arc::clone(&pipeline_run_repo);
     let claim_id = Uuid::new_v4();
     if !claim_repo

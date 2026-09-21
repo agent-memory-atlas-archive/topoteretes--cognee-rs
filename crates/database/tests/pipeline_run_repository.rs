@@ -265,6 +265,107 @@ async fn reset_orphans_does_not_rewrite_completed_successor() {
 }
 
 // ---------------------------------------------------------------------------
+// list_orphan_runs must name exactly what reset_orphans retires
+// ---------------------------------------------------------------------------
+
+/// Startup recovery lists the orphans, rolls back each one's graph and vector
+/// artifacts, and only then calls [`PipelineRunRepository::reset_orphans`]. So
+/// the two selections have to be the same set. A row the list missed but the
+/// reset retired would have its dataset re-opened with a dead run's artifacts
+/// still in the graph — the exact state the rollback exists to remove.
+///
+/// The returned rows must also carry `pipeline_run_id` (the ownership-ledger
+/// key) and `dataset_id`, because a sweep scope is built from both. `id` — the
+/// per-transition row key — is *not* what the ledger stores, and a sweep
+/// scoped on it would select nothing at all and report a clean rollback.
+#[tokio::test]
+async fn list_orphan_runs_names_exactly_what_reset_orphans_retires() {
+    let db = make_db().await;
+    let ds = Uuid::new_v4();
+    create_dataset(&db, ds).await;
+    let repo = make_repo(Arc::clone(&db));
+    let pipeline_id = Uuid::new_v4();
+
+    let initiated = Uuid::new_v4();
+    let started = Uuid::new_v4();
+    let completed = Uuid::new_v4();
+    let errored = Uuid::new_v4();
+
+    repo.log_pipeline_run(
+        initiated,
+        pipeline_id,
+        "p",
+        Some(ds),
+        PipelineRunStatus::Initiated,
+        None,
+    )
+    .await
+    .expect("log initiated");
+    repo.log_pipeline_run(
+        started,
+        pipeline_id,
+        "p",
+        Some(ds),
+        PipelineRunStatus::Started,
+        None,
+    )
+    .await
+    .expect("log started");
+    // A run that finished and one that already failed: neither is an orphan,
+    // and sweeping either would delete a settled run's artifacts.
+    for (run, last) in [
+        (completed, PipelineRunStatus::Completed),
+        (errored, PipelineRunStatus::Errored),
+    ] {
+        for status in [PipelineRunStatus::Started, last] {
+            repo.log_pipeline_run(run, pipeline_id, "p", Some(ds), status, None)
+                .await
+                .expect("log terminal run");
+        }
+    }
+
+    let mut listed: Vec<Uuid> = repo
+        .list_orphan_runs()
+        .await
+        .expect("list_orphan_runs")
+        .into_iter()
+        .inspect(|row| {
+            assert_eq!(
+                row.dataset_id,
+                Some(ds),
+                "a sweep scope needs the dataset id"
+            );
+        })
+        .map(|row| row.pipeline_run_id)
+        .collect();
+    listed.sort();
+
+    let mut expected = vec![initiated, started];
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "only the two runs still in flight may be listed"
+    );
+
+    // And the reset retires exactly that many — same selection, one helper.
+    assert_eq!(
+        repo.reset_orphans("agreement_check")
+            .await
+            .expect("reset_orphans"),
+        2
+    );
+
+    assert!(
+        repo.list_orphan_runs()
+            .await
+            .expect("list after reset")
+            .is_empty(),
+        "retiring them must empty the list — otherwise every restart would \
+         roll back the same runs again"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // list_recent — basic smoke test
 // ---------------------------------------------------------------------------
 

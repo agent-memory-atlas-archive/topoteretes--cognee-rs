@@ -2646,14 +2646,23 @@ impl ConfigManager {
             // `null` restores the derived answer, exactly as it does for
             // `chunk_size` and `llm_temperature`.
             "single_process" if value.is_null() => self.clear_single_process(),
-            // A string goes through the same parser the env var uses, so a
-            // binding passing `"1"` and `COGNEE_SINGLE_PROCESS=1` cannot mean
-            // different things — and a blank string means "derive", matching
-            // `null` above rather than reading as a silent `false`.
-            "single_process" if value.is_string() => {
-                match cognee_database::parse_single_process_override(
-                    as_string(key, &value)?.as_str(),
-                ) {
+            // A string *or a JSON number* goes through the same parser the env
+            // var uses, so a binding passing `"1"`, a binding passing `1`, and
+            // `COGNEE_SINGLE_PROCESS=1` cannot mean different things — and a
+            // blank string means "derive", matching `null` above rather than
+            // reading as a silent `false`.
+            //
+            // The number arm matters because callers reach this dispatcher
+            // with already-parsed JSON: `cognee-cli config set` parses its
+            // argument before dispatching, and a JS/Python binding passing the
+            // `1` the docs list as accepted sends a number, not a string.
+            // Without it, that hit `as_bool` and was rejected.
+            "single_process" if value.is_string() || value.is_number() => {
+                let raw = value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string());
+                match cognee_database::parse_single_process_override(&raw) {
                     Some(v) => self.set_single_process(v),
                     None => self.clear_single_process(),
                 }
@@ -2966,6 +2975,46 @@ mod tests {
         cm.set("single_process", serde_json::json!("   "))
             .expect("blank string");
         assert_eq!(cm.read().single_process, None, "blank means derive");
+    }
+
+    /// A JSON *number* must mean what the same digit means as a string.
+    ///
+    /// Callers reach this dispatcher with already-parsed JSON —
+    /// `cognee-cli config set single_process 1` parses its argument before
+    /// dispatching, and a JS or Python binding passing the `1` the docs list
+    /// as accepted sends a number. Both used to fall through to `as_bool` and
+    /// be rejected with "expects a boolean", so the documented value failed on
+    /// the documented spelling while the suite stayed green: it only ever
+    /// tested `Value::String("1")`, which is not what either caller sends.
+    #[test]
+    fn single_process_accepts_the_json_numbers_the_docs_list() {
+        let cm = ConfigManager::new(Settings::default());
+
+        cm.set("single_process", serde_json::json!(1))
+            .expect("`1` is documented as accepted");
+        assert_eq!(cm.read().single_process, Some(true));
+
+        cm.set("single_process", serde_json::json!(0))
+            .expect("`0` is documented as accepted");
+        assert_eq!(cm.read().single_process, Some(false));
+
+        // And a number agrees with the string spelling of itself, which is the
+        // invariant the shared parser exists to hold.
+        for raw in ["1", "0"] {
+            cm.set("single_process", serde_json::json!(raw))
+                .expect("string form");
+            let as_string = cm.read().single_process;
+            cm.set(
+                "single_process",
+                serde_json::Value::Number(raw.parse::<u64>().expect("digit").into()),
+            )
+            .expect("number form");
+            assert_eq!(
+                cm.read().single_process,
+                as_string,
+                "`{raw}` and \"{raw}\" must not mean different things"
+            );
+        }
     }
 
     /// The config snapshot must keep "derived" and "explicitly false" apart —

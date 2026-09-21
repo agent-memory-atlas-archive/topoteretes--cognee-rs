@@ -164,9 +164,30 @@ impl AppState {
     /// where the deployment asserts one process per relational database —
     /// also sweeps the exclusive-run claims that a killed predecessor could
     /// not release.
+    ///
+    /// Without graph/vector handles this cannot roll back what a killed run
+    /// wrote into those stores; see
+    /// [`Self::build_with_db_and_backends`], which the real startup path uses.
     pub async fn build_with_db(
         config: HttpServerConfig,
         db: Arc<DatabaseConnection>,
+    ) -> Result<Self, ServerError> {
+        Self::build_with_db_and_backends(config, db, None, None).await
+    }
+
+    /// [`Self::build_with_db`] plus the graph and vector stores, so startup
+    /// recovery can roll back the artifacts a killed run left in them.
+    ///
+    /// Both handles are `Option` because `ComponentHandles` carries them that
+    /// way; with either missing the rollback is skipped (and said so in the
+    /// log) while the two relational clears run exactly as before. A rollback
+    /// that could not reach one of the stores would delete the ownership rows
+    /// that record what still needs deleting, which is worse than not trying.
+    pub async fn build_with_db_and_backends(
+        config: HttpServerConfig,
+        db: Arc<DatabaseConnection>,
+        graph_db: Option<Arc<dyn cognee_graph::GraphDBTrait>>,
+        vector_db: Option<Arc<dyn cognee_vector::VectorDB>>,
     ) -> Result<Self, ServerError> {
         let repo = Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&db)))
             as Arc<dyn PipelineRunRepository>;
@@ -184,6 +205,37 @@ impl AppState {
         // exactly as before. `COGNEE_SINGLE_PROCESS` is how a single-process
         // deployment asserts what the URL cannot show.
         let sweep_claims = cognee_database::single_process_from_env(&config.relational_db_url);
+
+        // Roll back what those killed runs wrote into the graph and vector
+        // stores, *before* `new_with_orphan_reset` retires their status rows.
+        // Retiring first is what makes the dataset runnable again, so it would
+        // open a window in which a fresh run starts while this is still
+        // deleting the corpse's nodes. Python orders it the same way
+        // (`cognify_rollback_handler` before the status reset in
+        // `modules/cognify/recovery.py`).
+        //
+        // Gated on the same assertion as the claim sweep, and for a stronger
+        // reason: "in flight" and "dead" are the same observation only when no
+        // peer process could be running right now. On a shared database this
+        // would delete a live replica's graph artifacts mid-run.
+        if sweep_claims {
+            match (graph_db, vector_db) {
+                (Some(graph_db), Some(vector_db)) => {
+                    cognee_delete::sweep_orphaned_run_artifacts(
+                        repo.as_ref(),
+                        Arc::clone(&db),
+                        graph_db,
+                        vector_db,
+                    )
+                    .await;
+                }
+                _ => tracing::warn!(
+                    "single_process is asserted but the graph/vector backends are not wired, so \
+                     a killed run's artifacts cannot be rolled back; its pipeline_runs row and \
+                     claim are still cleared below"
+                ),
+            }
+        }
 
         // Run orphan reset on startup (best-effort — non-fatal).
         let pipelines: Arc<dyn PipelineRunRegistry> =

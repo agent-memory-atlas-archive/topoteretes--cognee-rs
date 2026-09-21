@@ -31,6 +31,51 @@ pub struct SeaOrmPipelineRunRepository {
 }
 
 impl SeaOrmPipelineRunRepository {
+    /// The `pipeline_runs` rows that are still in flight: the latest row per
+    /// `pipeline_run_id`, kept only when that row is `Initiated` or `Started`.
+    ///
+    /// Find all `pipeline_run_id`s whose latest row has no more recent
+    /// `Completed` / `Errored` successor. Implemented by fetching every row
+    /// ordered by `created_at DESC` and keeping the first one seen per
+    /// `pipeline_run_id`.
+    ///
+    /// **One definition, two callers, deliberately.** Both
+    /// [`PipelineRunRepository::list_orphan_runs`] and
+    /// [`PipelineRunRepository::reset_orphans`] go through this, because
+    /// startup recovery calls them in sequence: list the orphans, roll back
+    /// each one's graph/vector artifacts, *then* retire the rows. If the two
+    /// selections could drift, a row the list missed would still be retired —
+    /// re-opening its dataset with the dead run's partial artifacts left in
+    /// the graph, which is precisely the state the rollback exists to remove.
+    async fn latest_in_flight_rows(&self) -> Result<Vec<pipeline_run::Model>, DatabaseError> {
+        let all_rows = pipeline_run::Entity::find()
+            .order_by_desc(pipeline_run::Column::CreatedAt)
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                DatabaseError::QueryError(format!("in-flight pipeline-run scan failed: {e}"))
+            })?;
+
+        // Collect the latest row per pipeline_run_id.
+        let mut latest_per_run: HashMap<String, pipeline_run::Model> = HashMap::new();
+        for row in all_rows {
+            latest_per_run
+                .entry(row.pipeline_run_id.clone())
+                .or_insert(row);
+        }
+
+        Ok(latest_per_run
+            .into_values()
+            .filter(|row| {
+                matches!(
+                    row.status,
+                    pipeline_run::PipelineRunStatus::Initiated
+                        | pipeline_run::PipelineRunStatus::Started
+                )
+            })
+            .collect())
+    }
+
     /// `INSERT ... ON CONFLICT DO NOTHING`, returning whether the row was
     /// written. `false` means a claim already exists for the pair.
     ///
@@ -282,39 +327,20 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
         Ok(rows)
     }
 
+    async fn list_orphan_runs(&self) -> Result<Vec<PipelineRunRow>, DatabaseError> {
+        Ok(self
+            .latest_in_flight_rows()
+            .await?
+            .into_iter()
+            .map(PipelineRun::from)
+            .collect())
+    }
+
     async fn reset_orphans(&self, reason: &str) -> Result<u64, DatabaseError> {
-        // Find all pipeline_run_ids that have INITIATED or STARTED status
-        // and do NOT have a more recent COMPLETED or ERRORED row with the same
-        // pipeline_run_id. We implement this by fetching the latest row per
-        // pipeline_run_id and checking its status.
-        //
-        // Strategy: fetch all rows ordered by (pipeline_run_id, created_at DESC),
-        // then for each unique pipeline_run_id, check if the latest row is stuck.
-
-        let all_rows = pipeline_run::Entity::find()
-            .order_by_desc(pipeline_run::Column::CreatedAt)
-            .all(self.db.as_ref())
-            .await
-            .map_err(|e| DatabaseError::QueryError(format!("reset_orphans fetch failed: {e}")))?;
-
-        // Collect the latest row per pipeline_run_id.
-        let mut latest_per_run: HashMap<String, pipeline_run::Model> = HashMap::new();
-        for row in all_rows {
-            latest_per_run
-                .entry(row.pipeline_run_id.clone())
-                .or_insert(row);
-        }
-
-        // Find rows that are stuck in INITIATED or STARTED.
-        let orphan_ids: Vec<String> = latest_per_run
-            .into_values()
-            .filter(|row| {
-                matches!(
-                    row.status,
-                    pipeline_run::PipelineRunStatus::Initiated
-                        | pipeline_run::PipelineRunStatus::Started
-                )
-            })
+        let orphan_ids: Vec<String> = self
+            .latest_in_flight_rows()
+            .await?
+            .into_iter()
             .map(|row| row.id)
             .collect();
 

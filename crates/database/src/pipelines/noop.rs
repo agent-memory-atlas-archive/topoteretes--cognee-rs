@@ -87,6 +87,12 @@ impl PipelineRunRepository for NoopPipelineRunRepository {
         Ok(0)
     }
 
+    /// No rows, so no orphans — the counterpart of the `Ok(0)` below, spelled
+    /// out for the same reason.
+    async fn list_orphan_runs(&self) -> Result<Vec<PipelineRunRow>, DatabaseError> {
+        Ok(Vec::new())
+    }
+
     async fn reset_orphans(&self, _reason: &str) -> Result<u64, DatabaseError> {
         Ok(0)
     }

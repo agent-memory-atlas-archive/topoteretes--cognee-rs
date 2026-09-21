@@ -478,14 +478,24 @@ pub fn set_value(settings: &mut Settings, key: &str, value: Value) -> Result<(),
         "db_username" => settings.db_username = expect_string(key, value)?,
         "db_password" => settings.db_password = expect_string(key, value)?,
         // `null` restores the derivation, like `chunk_size` above. A string
-        // goes through the same parser `COGNEE_SINGLE_PROCESS` uses, so
-        // `cognee config set single_process 1` and the env var cannot mean
-        // different things — and a blank string means "derive", not `false`.
+        // *or a JSON number* goes through the same parser
+        // `COGNEE_SINGLE_PROCESS` uses, so `cognee config set single_process 1`
+        // and the env var cannot mean different things — and a blank string
+        // means "derive", not `false`.
+        //
+        // The number case is not hypothetical. `commands::config::handle_set`
+        // JSON-parses the raw argument before it gets here, so the `1` the
+        // docs list as accepted arrives as `Value::Number`, not
+        // `Value::String("1")`. Without this arm it fell through to
+        // `expect_bool` and was rejected with "expects true/false" — the
+        // documented spelling failing on the documented value.
         "single_process" if value.is_null() => settings.single_process = None,
-        "single_process" if value.is_string() => {
-            settings.single_process = value
+        "single_process" if value.is_string() || value.is_number() => {
+            let raw = value
                 .as_str()
-                .and_then(cognee::database::parse_single_process_override);
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            settings.single_process = cognee::database::parse_single_process_override(&raw);
         }
         "single_process" => settings.single_process = Some(expect_bool(key, value)?),
         "default_system_prompt_path" => {
@@ -788,6 +798,51 @@ mod tests {
             settings.single_process, None,
             "`cognee config unset` must restore the derived answer"
         );
+    }
+
+    /// `cognee config set single_process 1` must work, because the
+    /// documentation lists `1` as an accepted value.
+    ///
+    /// The bug this pins: `commands::config::handle_set` JSON-parses the raw
+    /// argument before calling [`set_value`], so the bare `1` an operator
+    /// types never arrives as `Value::String("1")` — it arrives as
+    /// `Value::Number(1)`, which fell through to `expect_bool` and was
+    /// rejected with "expects true/false". The existing coverage above only
+    /// used the string form, which the CLI can never actually produce for a
+    /// bare digit, so the suite was green while the documented invocation
+    /// failed.
+    #[test]
+    fn a_json_number_sets_single_process_the_way_the_docs_promise() {
+        // Exactly what `handle_set` hands to `set_value` for these arguments.
+        let parse = |raw: &str| {
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+        };
+        assert!(
+            parse("1").is_number(),
+            "the premise: the CLI's own parse turns `1` into a number, not a string"
+        );
+
+        let mut settings = Settings::default();
+
+        set_value(&mut settings, "single_process", parse("1")).expect("`config set … 1`");
+        assert_eq!(settings.single_process, Some(true));
+
+        set_value(&mut settings, "single_process", parse("0")).expect("`config set … 0`");
+        assert_eq!(settings.single_process, Some(false));
+
+        // And the spellings that already worked must keep working, through the
+        // same parser, so no two of them can disagree.
+        for (raw, expected) in [
+            ("true", Some(true)),
+            ("false", Some(false)),
+            ("yes", Some(true)),
+            ("no", Some(false)),
+            ("on", Some(true)),
+            ("null", None),
+        ] {
+            set_value(&mut settings, "single_process", parse(raw)).expect(raw);
+            assert_eq!(settings.single_process, expected, "`config set … {raw}`");
+        }
     }
 
     /// The flat map is what `cognee config get` prints, and `null` there means

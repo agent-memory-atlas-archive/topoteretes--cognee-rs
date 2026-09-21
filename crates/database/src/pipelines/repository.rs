@@ -100,10 +100,46 @@ pub trait PipelineRunRepository: Send + Sync {
             .collect())
     }
 
+    /// The runs [`Self::reset_orphans`] would retire, *before* it retires
+    /// them: the latest row per `pipeline_run_id` that is still `INITIATED` /
+    /// `STARTED` with no more recent successor.
+    ///
+    /// # Why this is separate from the reset
+    ///
+    /// Retiring the status row is only half of recovering a killed run. The
+    /// other half is rolling back what the dead run wrote into the graph and
+    /// vector stores — the ownership-ledger rows keyed by its
+    /// `pipeline_run_id` — because a cognify completion marker is written
+    /// only on success, so the next run re-processes every item and extracts
+    /// those entities a second time alongside the ones the corpse left behind.
+    ///
+    /// That rollback lives in `cognee_delete::RunSweeper`, in a crate *above*
+    /// this one (`cognee-delete` depends on `cognee-database`, so the
+    /// dependency cannot be inverted). Splitting "find" from "retire" is what
+    /// lets the caller interleave the two: list, sweep each listed run, then
+    /// reset. `cognee_delete::sweep_orphaned_run_artifacts` is the intended
+    /// consumer, and `Settings::resolved_single_process` is the assertion the
+    /// whole sequence is gated on.
+    ///
+    /// The returned rows carry both ids a sweep needs: `pipeline_run_id` (the
+    /// ownership-ledger key — *not* `id`, which keys this one status
+    /// transition) and `dataset_id`.
+    ///
+    /// The default implementation reports no orphans, matching the
+    /// implementations that persist nothing and therefore never strand one.
+    async fn list_orphan_runs(&self) -> Result<Vec<PipelineRunRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Restart-orphan reset: rewrite any row stuck in `INITIATED` / `STARTED`
     /// without a more recent successor to `ERRORED` with the given `reason`.
     ///
     /// Returns the number of rows rewritten.
+    ///
+    /// Selects exactly what [`Self::list_orphan_runs`] returns. A startup
+    /// sweep rolls back the listed runs' artifacts and then calls this; a row
+    /// retired here that the list did not name would have its dataset
+    /// re-opened with a dead run's artifacts still in the graph.
     async fn reset_orphans(&self, reason: &str) -> Result<u64, DbError>;
 
     /// Upsert a single payload field for a run. Concurrent calls with the

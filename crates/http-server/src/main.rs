@@ -116,9 +116,17 @@ async fn main() -> anyhow::Result<()> {
 
     let mut state = match handles {
         Some(handles) => {
-            let mut state = AppState::build_with_db(cfg.clone(), handles.database.clone())
-                .await
-                .context("failed to build AppState with database")?;
+            // The graph/vector handles go in so startup recovery can roll back
+            // what a killed run wrote into those stores, not just clear the
+            // two relational gates it leaves set.
+            let mut state = AppState::build_with_db_and_backends(
+                cfg.clone(),
+                handles.database.clone(),
+                handles.graph_db.clone(),
+                handles.vector_db.clone(),
+            )
+            .await
+            .context("failed to build AppState with database")?;
             state.lib = Some(Arc::new(handles));
             state.install_real_health_checker();
             state

@@ -160,22 +160,102 @@ impl AppState {
     /// registry.  Used by the server startup path when backend env vars are
     /// present.
     ///
-    /// Runs the orphan-reset once on startup per pipelines.md §12.
+    /// Runs the orphan-reset once on startup per pipelines.md §12, and — only
+    /// where the deployment asserts one process per relational database —
+    /// also sweeps the exclusive-run claims that a killed predecessor could
+    /// not release.
+    ///
+    /// Without graph/vector handles this cannot roll back what a killed run
+    /// wrote into those stores; see
+    /// [`Self::build_with_db_and_backends`], which the real startup path uses.
     pub async fn build_with_db(
         config: HttpServerConfig,
         db: Arc<DatabaseConnection>,
+    ) -> Result<Self, ServerError> {
+        Self::build_with_db_and_backends(config, db, None, None).await
+    }
+
+    /// [`Self::build_with_db`] plus the graph and vector stores, so startup
+    /// recovery can roll back the artifacts a killed run left in them.
+    ///
+    /// Both handles are `Option` because `ComponentHandles` carries them that
+    /// way; with either missing the rollback is skipped (and said so in the
+    /// log) while the two relational clears run exactly as before. A rollback
+    /// that could not reach one of the stores would delete the ownership rows
+    /// that record what still needs deleting, which is worse than not trying.
+    pub async fn build_with_db_and_backends(
+        config: HttpServerConfig,
+        db: Arc<DatabaseConnection>,
+        graph_db: Option<Arc<dyn cognee_graph::GraphDBTrait>>,
+        vector_db: Option<Arc<dyn cognee_vector::VectorDB>>,
     ) -> Result<Self, ServerError> {
         let repo = Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&db)))
             as Arc<dyn PipelineRunRepository>;
         let registry_cfg = config.to_registry_config();
 
+        // Clearing claims is sound only with no peer process: a claim is
+        // released by its holder alone, so where one process owns the database
+        // every surviving claim at startup belongs to a dead predecessor.
+        //
+        // The derivation is deliberately narrow — only in-memory SQLite, which
+        // no other process can open, qualifies on its own. This server's own
+        // default is a SQLite *file*, which `cognee-cli` or a second server can
+        // open at the same time, and a multi-replica deployment shares a
+        // Postgres; both derive `false` here and keep cross-process exclusion
+        // exactly as before. `COGNEE_SINGLE_PROCESS` is how a single-process
+        // deployment asserts what the URL cannot show.
+        let sweep_claims = cognee_database::single_process_from_env(&config.relational_db_url);
+
+        // Roll back what those killed runs wrote into the graph and vector
+        // stores, *before* `new_with_orphan_reset` retires their status rows.
+        // Retiring first is what makes the dataset runnable again, so it would
+        // open a window in which a fresh run starts while this is still
+        // deleting the corpse's nodes. Python orders it the same way
+        // (`cognify_rollback_handler` before the status reset in
+        // `modules/cognify/recovery.py`).
+        //
+        // Gated on the same assertion as the claim sweep, and for a stronger
+        // reason: "in flight" and "dead" are the same observation only when no
+        // peer process could be running right now. On a shared database this
+        // would delete a live replica's graph artifacts mid-run.
+        if sweep_claims {
+            match (graph_db, vector_db) {
+                (Some(graph_db), Some(vector_db)) => {
+                    cognee_delete::sweep_orphaned_run_artifacts(
+                        repo.as_ref(),
+                        Arc::clone(&db),
+                        graph_db,
+                        vector_db,
+                    )
+                    .await;
+                }
+                _ => tracing::warn!(
+                    "single_process is asserted but the graph/vector backends are not wired, so \
+                     a killed run's artifacts cannot be rolled back; its pipeline_runs row and \
+                     claim are still cleared below"
+                ),
+            }
+        }
+
         // Run orphan reset on startup (best-effort — non-fatal).
         let pipelines: Arc<dyn PipelineRunRegistry> =
-            match DefaultPipelineRunRegistry::new_with_orphan_reset(repo, registry_cfg).await {
+            match DefaultPipelineRunRegistry::new_with_orphan_reset(
+                repo,
+                registry_cfg,
+                sweep_claims,
+            )
+            .await
+            {
                 Ok(r) => r,
-                Err(e) => {
+                Err(_) => {
+                    // The error is deliberately not repeated here:
+                    // `new_with_orphan_reset` already logged which of its two
+                    // startup steps failed and why, and echoing it made the
+                    // server report one failure twice. What this line adds is
+                    // the consequence — the registry is built without them.
                     tracing::warn!(
-                        "pipeline registry startup orphan-reset failed (non-fatal): {e}"
+                        "continuing without startup pipeline-run recovery (non-fatal); see the \
+                         warning above for which step failed"
                     );
                     // Fall back to plain new() without reset.
                     let repo2 = Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&db)))

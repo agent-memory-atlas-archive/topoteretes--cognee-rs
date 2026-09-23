@@ -36,7 +36,7 @@ type NodeLite = Value;
 
 /// A resolved entity plus its ranked edge bullets.
 ///
-/// Port of the Python entity dict (`_entity_from_result`, `entities.py:86-98`).
+/// Port of the Python entity dict (`_entity_from_result`, `entities.py:165-177`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EntityResult {
     pub id: String,
@@ -48,7 +48,7 @@ pub(crate) struct EntityResult {
 
 /// A single rendered edge bullet for an entity.
 ///
-/// Port of the Python edge dict (`_edge_bullet`, `entities.py:183-201`).
+/// Port of the Python edge dict (`_edge_bullet`, `entities.py:262-281`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EdgeBullet {
     pub text: String,
@@ -62,7 +62,7 @@ pub(crate) struct EdgeBullet {
 
 /// Build the entity blocks for the given `Entity_name` hits.
 ///
-/// Port of `build_entities` (`entities.py:15-44`). Returns `[]` for no hits.
+/// Port of `build_entities` (`entities.py:41-77`). Returns `[]` for no hits.
 /// Builds one entity per hit; if no hit has a nonempty id, returns the entities
 /// unedited (no neighborhood call). Otherwise fetches the one-hop neighborhood
 /// and attaches ranked edge bullets. **Fail-open:** a `get_neighborhood` error
@@ -112,8 +112,10 @@ pub(crate) async fn build_entities(
 
 /// Resolve a single entity hit into an [`EntityResult`] with empty edges.
 ///
-/// Port of `_entity_from_result` (`entities.py:86-98`). `name` falls back
-/// `name` → `text` → `id`, never empty.
+/// Port of `_entity_from_result` (`entities.py:165-177`). `name` falls back
+/// `name` → `text` → `id`, never empty. `text` is where the indexer puts the
+/// entity's name, as Python's `IndexSchema` does; a row written before the
+/// indexer carried it resolves to its id.
 fn entity_from_result(item: &SearchItem) -> EntityResult {
     let result_payload = payload(item);
     let entity_id = result_id(item).unwrap_or_default();
@@ -140,14 +142,20 @@ fn entity_from_result(item: &SearchItem) -> EntityResult {
 
 /// Resolve an entity's domain type from a payload/entity object.
 ///
-/// Port of `_entity_type` (`entities.py:122-127`): the first nonblank
-/// `display_value` of `is_a` then `type`, suppressing the literal
-/// `"IndexSchema"` structural type; else `None`.
+/// Port of `_entity_type` (`entities.py:201-206`): the first nonblank
+/// `display_value` of `is_a` then `type`, suppressing the payload's structural
+/// type; else `None`.
+///
+/// Python suppresses `"IndexSchema"`, the class every one of its vector rows
+/// is written as. A Rust row's `type` is the indexed DataPoint's class instead
+/// — `"Entity"` on `Entity_name` — so that is suppressed too. Neither side's
+/// payload carries a domain type under these keys, so the header is
+/// `### {name}` on both.
 fn entity_type(result_payload: &Value) -> Option<String> {
     for key in ["is_a", "type"] {
         if let Some(value) = result_payload.get(key)
             && let Some(entity_type) = display_value(value)
-            && entity_type != "IndexSchema"
+            && !is_structural_type(&entity_type)
         {
             return Some(entity_type);
         }
@@ -155,10 +163,16 @@ fn entity_type(result_payload: &Value) -> Option<String> {
     None
 }
 
+/// Whether `value` names the vector row's schema class rather than a domain
+/// type — see [`entity_type`].
+fn is_structural_type(value: &str) -> bool {
+    matches!(value, "IndexSchema" | "Entity")
+}
+
 /// Rebuild per-entity `(source, edge, target)` connection triples from the flat
 /// one-hop subgraph.
 ///
-/// Port of `_partition_neighborhood` (`entities.py:47-72`). Each seed id gets an
+/// Port of `_partition_neighborhood` (`entities.py:80-105`). Each seed id gets an
 /// (initially empty) connection list. A triple is pushed onto its `source_id`'s
 /// list (when that id is a seed) and onto its `target_id`'s list (when that id
 /// is a seed **and** differs from `source_id`, deduping self-loops). Edges with
@@ -240,7 +254,7 @@ fn id_only_object(id: &str) -> Map<String, Value> {
 
 /// Build ranked, deduped, capped edge bullets for one entity's connections.
 ///
-/// Port of `_edge_bullets_from_connections` (`entities.py:130-161`). `max_edges
+/// Port of `_edge_bullets_from_connections` (`entities.py:209-240`). `max_edges
 /// == 0` yields `[]`. Empty-text bullets are skipped. Dedupe runs on two
 /// **independent** tracks: a keyed `(source_id, relationship, target_id)` set
 /// and a text-only set — a keyed bullet is never checked against the text set
@@ -288,7 +302,7 @@ fn edge_bullets_from_connections(
 
 /// Sort key: type edges first, then query-ranked edges, then legacy order.
 ///
-/// Port of `_edge_sort_key` (`entities.py:164-171`): `(0, 0)` for a type edge;
+/// Port of `_edge_sort_key` (`entities.py:243-250`): `(0, 0)` for a type edge;
 /// `(1, rank)` when the edge's `edge_type_id` is in `edge_ranks`; else `(2, 0)`.
 fn edge_sort_key(edge: &EdgeBullet, edge_ranks: &HashMap<String, usize>) -> (u8, usize) {
     if is_type_edge(edge) {
@@ -302,7 +316,7 @@ fn edge_sort_key(edge: &EdgeBullet, edge_ranks: &HashMap<String, usize>) -> (u8,
 
 /// Render a single connection triple into an [`EdgeBullet`], or `None` to drop.
 ///
-/// Port of `_edge_bullet` (`entities.py:183-201`). Text prefers the top-level
+/// Port of `_edge_bullet` (`entities.py:262-281`). Text prefers the top-level
 /// `edge_text` (absent from graph triples in practice, kept for fidelity), then
 /// the nested `properties.edge_text`, then a synthesized
 /// `"{source} -- {relationship} -- {target}"` when all three labels are present;
@@ -342,7 +356,7 @@ fn edge_bullet(source: &NodeLite, edge: &EdgeLite, target: &NodeLite) -> Option<
 
 /// The dedupe key for a bullet, or `None` when any component is blank.
 ///
-/// Port of `_edge_dedupe_key` (`entities.py:204-210`).
+/// Port of `_edge_dedupe_key` (`entities.py:284-290`).
 fn edge_dedupe_key(edge: &EdgeBullet) -> Option<(String, String, String)> {
     match (&edge.source_id, &edge.relationship, &edge.target_id) {
         (Some(source_id), Some(relationship), Some(target_id)) => {
@@ -354,7 +368,7 @@ fn edge_dedupe_key(edge: &EdgeBullet) -> Option<(String, String, String)> {
 
 /// Whether a bullet is an `is a` / type edge.
 ///
-/// Port of `_is_type_edge` (`entities.py:213-221`). The relationship is
+/// Port of `_is_type_edge` (`entities.py:300-304`). The relationship is
 /// normalized (lowercase, `_`/`-` → space, trimmed) and compared to `"is a"`;
 /// otherwise the bullet text (lowercased and padded) is scanned for `" is a "`.
 fn is_type_edge(edge: &EdgeBullet) -> bool {
@@ -370,7 +384,7 @@ fn is_type_edge(edge: &EdgeBullet) -> bool {
 
 /// The nested `properties.edge_text` of an edge, or `None`.
 ///
-/// Port of `_nested_edge_text` (`entities.py:224-228`).
+/// Port of `_nested_edge_text` (`entities.py:307-311`).
 fn nested_edge_text(edge: &EdgeLite) -> Option<String> {
     edge.properties
         .as_ref()
@@ -381,7 +395,7 @@ fn nested_edge_text(edge: &EdgeLite) -> Option<String> {
 
 /// A node's display label: its `name`, then its `id`.
 ///
-/// Port of `_node_label` (`entities.py:231-233`).
+/// Port of `_node_label` (`entities.py:314-315`).
 fn node_label(node: &NodeLite) -> Option<String> {
     let mut candidates: Vec<&Value> = Vec::new();
     if let Some(value) = node.get("name") {
@@ -395,7 +409,7 @@ fn node_label(node: &NodeLite) -> Option<String> {
 
 /// Render the entity blocks as the "Relevant entities" markdown section.
 ///
-/// Port of `format_entities` (`entities.py:75-83`). Empty if no entity yields a
+/// Port of `format_entities` (`entities.py:154-162`). Empty if no entity yields a
 /// nonempty block; otherwise a `"## Relevant entities"` header followed by the
 /// blocks joined by a blank line.
 pub(crate) fn format_entities(entities: &[EntityResult]) -> String {
@@ -412,8 +426,8 @@ pub(crate) fn format_entities(entities: &[EntityResult]) -> String {
 
 /// Render a single entity block, or `""` when its name is blank.
 ///
-/// Port of `_format_entity` (`entities.py:101-119`). Header is
-/// `"### {name} ({type})"` or `"### {name}"` (the `IndexSchema` structural type
+/// Port of `_format_entity` (`entities.py:180-198`). Header is
+/// `"### {name} ({type})"` or `"### {name}"` (a structural type, see [`is_structural_type`],
 /// is suppressed), followed by the description line if present and one
 /// `"- {text}"` per edge with nonblank text.
 fn format_entity(entity: &EntityResult) -> String {
@@ -426,7 +440,7 @@ fn format_entity(entity: &EntityResult) -> String {
         .entity_type
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "IndexSchema");
+        .filter(|value| !value.is_empty() && !is_structural_type(value));
     let header = match entity_type {
         Some(entity_type) => format!("### {name} ({entity_type})"),
         None => format!("### {name}"),
@@ -469,6 +483,45 @@ mod tests {
             score: None,
             payload,
         }
+    }
+
+    /// An `Entity_name` row as the Rust indexer writes it: the base
+    /// DataPoint's keys (structural `"type": "Entity"`, `metadata`), plus
+    /// `text` holding the entity's name and the indexer's own `entity_type`.
+    fn rust_entity_hit() -> SearchItem {
+        SearchItem {
+            id: "53105ee7-4467-5f5e-a959-5632b495e0c6".parse().ok(),
+            score: None,
+            payload: json!({
+                "id": "53105ee7-4467-5f5e-a959-5632b495e0c6",
+                "type": "Entity",
+                "field": "name",
+                "text": "Alice",
+                "entity_type": "person",
+                "metadata": { "index_fields": ["name"], "original_node_id": "person:alice" },
+            }),
+        }
+    }
+
+    /// Renders as Python renders its `IndexSchema` row for the same entity:
+    /// the name from `text`, and no type, since neither payload holds a domain
+    /// type under `is_a`/`type`.
+    #[test]
+    fn a_rust_written_row_renders_as_python_renders_it() {
+        let entity = entity_from_result(&rust_entity_hit());
+        assert_eq!(entity.name, "Alice");
+        assert_eq!(entity.entity_type, None);
+        assert_eq!(format_entity(&entity), "### Alice");
+    }
+
+    #[test]
+    fn an_entity_with_nothing_usable_still_renders_as_its_id() {
+        let entity = entity_from_result(&entity_hit(json!({
+            "id": "53105ee7-4467-5f5e-a959-5632b495e0c6",
+            "type": "Entity",
+        })));
+        assert_eq!(entity.name, "53105ee7-4467-5f5e-a959-5632b495e0c6");
+        assert_eq!(entity.entity_type, None);
     }
 
     fn edge_hit(text: &str) -> SearchItem {
@@ -771,6 +824,9 @@ mod tests {
 
         let domain = json!({"id": "e", "type": "Office"});
         assert_eq!(entity_type(&domain), Some("Office".to_string()));
+
+        let only_entity = json!({"id": "e", "type": "Entity"});
+        assert_eq!(entity_type(&only_entity), None);
     }
 
     #[tokio::test]

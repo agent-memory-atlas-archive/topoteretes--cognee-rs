@@ -2116,8 +2116,25 @@ impl Llm for OpenAIAdapter {
     }
 
     fn max_context_length(&self) -> u32 {
-        // Context lengths for common OpenAI models
-        match self.model.as_str() {
+        // Input-token limits for OpenAI model families, most specific prefix
+        // first. Hardcoded because the API has nowhere to ask: the `/v1/models`
+        // object carries only `id`, `created`, `object` and `owned_by`. The
+        // numbers are litellm's `max_input_tokens`
+        // (`model_prices_and_context_window.json`), the table Python cognee
+        // reads its model limits from.
+        //
+        // The input limit, not the total window: gpt-5's 400k window is 272k
+        // in + 128k out, and a prompt sized against the total is rejected.
+        //
+        // The hybrid retriever budgets its context against this number, so an
+        // under-report trims the context of a model that could have read it
+        // all: every current family must be listed before the `gpt-4` catch-all.
+        let model = self.model.to_lowercase();
+        match model.as_str() {
+            m if m.starts_with("gpt-5") => 272_000,
+            m if m.starts_with("gpt-4.1") => 1_047_576,
+            m if m.starts_with("gpt-4o") => 128_000,
+            m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 200_000,
             m if m.starts_with("gpt-4-turbo") => 128_000,
             m if m.starts_with("gpt-4-32k") => 32_768,
             m if m.starts_with("gpt-4") => 8_192,
@@ -4466,6 +4483,19 @@ mod tests {
 
         let adapter = OpenAIAdapter::new("gpt-3.5-turbo-16k", "key", None).unwrap();
         assert_eq!(adapter.max_context_length(), 16_384);
+
+        // Current families must not fall through to the `gpt-4` / default arms.
+        for (model, window) in [
+            ("gpt-5-mini", 272_000),
+            ("gpt-4.1-mini", 1_047_576),
+            ("gpt-4o-mini", 128_000),
+            ("gpt-4o", 128_000),
+            ("o3-mini", 200_000),
+            ("o4-mini", 200_000),
+        ] {
+            let adapter = OpenAIAdapter::new(model, "key", None).unwrap();
+            assert_eq!(adapter.max_context_length(), window, "{model}");
+        }
     }
 
     #[test]
